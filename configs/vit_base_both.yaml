@@ -1,0 +1,44 @@
+# Prune ViT-base MLP (30%) and attention Q/K dims (25%) with per-target
+# sparsities. Attention pruning uses dim-logit mode (the only supported mode).
+# Omit `sparsity:` and provide `mlp_sparsity`/`attn_sparsity` to trigger the
+# split form.
+
+model:
+  source: timm
+  name: vit_base_patch16_224
+  pretrained: true
+
+task: imagenet_classification
+
+dataset:
+  calib_path: data/imagenet-mini/val
+  val_path: data/imagenet-mini/val
+  calib_samples: 2048
+  batch_size: 32
+  num_workers: 4
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+
+pruning:
+  target: both
+  schedule: layerwise
+  # sparsity: 0.3        # NOT set — using the split form below
+  mlp_sparsity: 0.30
+  attn_sparsity: 0.25
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  min_channels: 128
+  min_qk_dim: 8
+
+collector:
+  covariance_mode: exact
+  store_raw: false
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  calib_samples: 2048

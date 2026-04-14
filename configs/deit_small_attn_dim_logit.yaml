@@ -1,0 +1,45 @@
+# Prune Q/K dimensions per head on DeiT-small, using the Sylvester-based
+# logit-matching compensation (attention pruning always uses dim-logit;
+# requires covariance_mode: exact).
+
+model:
+  source: timm
+  name: deit_small_patch16_224
+  pretrained: true
+
+task: imagenet_classification
+
+dataset:
+  calib_path: data/imagenet-mini/val
+  val_path: data/imagenet-mini/val
+  calib_samples: 2048
+  batch_size: 32
+  num_workers: 4
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+  force_recollect: false
+
+pruning:
+  target: attn
+  schedule: layerwise
+  sparsity: 0.25
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  auto_shrinkage: true
+  min_channels: 64
+  min_qk_dim: 8
+  qk_sparsity: 0.3
+
+collector:
+  covariance_mode: exact
+  store_raw: false
+  subsample_tokens: null
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  calib_samples: 2048

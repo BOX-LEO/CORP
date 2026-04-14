@@ -18,7 +18,7 @@ import gc
 
 from config.schemas import (
     CollectorConfig, PruningConfig, RunnerConfig, FullConfig,
-    CovarianceMode, PruneTarget, AttentionPruneMode,
+    CovarianceMode, PruneTarget,
 )
 from .collect import ActivationCollector, detect_model_structure, get_hook_points, detect_mlp_type, get_mlp_intermediate_dim
 from .stats import RedundancyAnalyzer, RedundancyReport, QKDimReport
@@ -83,15 +83,9 @@ class PruneRunner:
 
         # Set up components
         self.analyzer = RedundancyAnalyzer()
-        # Create rankers for MLP (uses min_channels) and attention (uses min_heads)
         self.ranker_mlp = StructureRanker.from_config(
             self.pruning_config.ranker,
             min_channels=self.pruning_config.min_channels,
-            keep_topk_outliers=self.pruning_config.keep_topk_outliers,
-        )
-        self.ranker_attn = StructureRanker.from_config(
-            self.pruning_config.ranker,
-            min_channels=self.pruning_config.min_heads,
             keep_topk_outliers=self.pruning_config.keep_topk_outliers,
         )
         self.compensator = AffineCompensator(
@@ -171,9 +165,6 @@ class PruneRunner:
         metrics_file = output_dir / "metrics.jsonl"
 
         try:
-            # Get attention prune mode
-            attn_mode = self.pruning_config.attn_prune_mode.value
-
             target = self.pruning_config.target
 
             # Try loading from stats cache
@@ -183,7 +174,6 @@ class PruneRunner:
                 cache_key = compute_cache_key(
                     model_name=model_name,
                     calib_samples=self.runner_config.calib_samples,
-                    attn_mode=attn_mode,
                     subsample_tokens=self.collector_config.subsample_tokens,
                 )
                 if not self.force_recollect:
@@ -198,21 +188,16 @@ class PruneRunner:
                 # stats so the cache is reusable regardless of pruning target.
                 collect_target_override = 'both' if self.stats_cache_dir is not None else None
                 all_stats = self._collect_activations(
-                    pruned_model, calib_loader, structure, attn_mode,
+                    pruned_model, calib_loader, structure,
                     target_override=collect_target_override,
                 )
 
-                # Generate Q/K dimension reports if using dim pruning mode
-                qk_reports = {}
-                if attn_mode == 'dim-logit':
-                    qk_reports = self.analyzer.generate_all_qk_dim_reports(all_stats)
+                qk_reports = self.analyzer.generate_all_qk_dim_reports(all_stats)
 
-                # Save to cache
                 if self.stats_cache_dir is not None and cache_key is not None:
                     metadata = {
                         "model_name": model_name,
                         "calib_samples": self.runner_config.calib_samples,
-                        "attn_mode": attn_mode,
                         "subsample_tokens": self.collector_config.subsample_tokens,
                     }
                     save_stats_cache(
@@ -227,38 +212,9 @@ class PruneRunner:
             current_round = -1
 
             for step in schedule.iterate(layer_dims, self.pruning_config.sparsity):
-                # Check if new round - recalibrate if needed
-                # Skip recalibration for Q/K dim pruning modes since different layers
-                # will have different dimensions after pruning
-                should_recalibrate = (
-                    step.round_num > current_round
-                    and schedule.requires_recalibration()
-                    and attn_mode != 'dim-logit'  # Skip for Q/K dim pruning
-                )
-                if should_recalibrate:
-                    if current_round >= 0:
-                        logger.info(f"Recalibrating for round {step.round_num}")
-                        # Free old stats and reports before collecting new ones
-                        del all_stats
-                        del reports
-                        if qk_reports:
-                            del qk_reports
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        # Re-detect model structure since pruning may have changed dimensions
-                        structure = detect_model_structure(pruned_model)
-                        all_stats = self._collect_activations(pruned_model, calib_loader, structure, attn_mode)
-                        reports = self.analyzer.reports_from_all_stats(all_stats)
-                        if attn_mode == 'dim-logit':
-                            qk_reports = self.analyzer.generate_all_qk_dim_reports(all_stats)
-                        else:
-                            qk_reports = {}
-                current_round = step.round_num
-
-                # Determine target type for this layer
-                # Use value comparison to handle different enum imports
+                # MLP pruning may recalibrate between layers; attn (dim-logit)
+                # skips recalibration since per-layer dims diverge.
                 target_value = target.value if hasattr(target, 'value') else target
-
                 if step.layer_name.endswith('.mlp'):
                     target_type = 'mlp'
                 elif step.layer_name.endswith('.attn'):
@@ -268,12 +224,26 @@ class PruneRunner:
                 elif target_value == 'attn':
                     target_type = 'attn'
                 else:
-                    # For BOTH without suffix, skip (should have suffix)
                     logger.warning(f"Cannot determine target type for {step.layer_name}")
                     continue
 
-                # Handle dim-logit attention separately (has its own per-head ranking)
-                if target_type == 'attn' and attn_mode == 'dim-logit':
+                should_recalibrate = (
+                    step.round_num > current_round
+                    and schedule.requires_recalibration()
+                    and target_type != 'attn'
+                )
+                if should_recalibrate and current_round >= 0:
+                    logger.info(f"Recalibrating for round {step.round_num}")
+                    del all_stats, reports, qk_reports
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    structure = detect_model_structure(pruned_model)
+                    all_stats = self._collect_activations(pruned_model, calib_loader, structure)
+                    reports = self.analyzer.reports_from_all_stats(all_stats)
+                    qk_reports = self.analyzer.generate_all_qk_dim_reports(all_stats)
+                current_round = step.round_num
+
+                if target_type == 'attn':
                     prune_per_head, surv_per_head = self._prune_attention_qk_dims(
                         pruned_model, step.layer_name, qk_reports, all_stats,
                         skip_compensation
@@ -289,7 +259,6 @@ class PruneRunner:
                     comp_cond = 0.0
 
                 else:
-                    # MLP or head-mode attention: use report-based ranking
                     layer_key = self._find_layer_key(step.layer_name, reports, target_type)
                     if layer_key is None:
                         logger.warning(f"No report for layer {step.layer_name} (target={target_type}), skipping")
@@ -298,42 +267,28 @@ class PruneRunner:
                     report = reports[layer_key]
                     stats = all_stats[layer_key]
 
-                    # Get module (needed for weight-based ranking)
-                    if target_type == 'mlp':
-                        module = self._get_mlp_module(pruned_model, step.layer_name)
-                        module_type = 'mlp'
-                    else:
-                        module = self._get_attn_module(pruned_model, step.layer_name)
-                        module_type = 'attn'
-
+                    module = self._get_mlp_module(pruned_model, step.layer_name)
                     if module is None:
                         logger.warning(f"Could not find module for {step.layer_name}")
                         continue
 
-                    ranker = self.ranker_mlp if target_type == 'mlp' else self.ranker_attn
-                    prune_idx, surv_idx = ranker.select_for_sparsity(
+                    prune_idx, surv_idx = self.ranker_mlp.select_for_sparsity(
                         report, step.sparsity,
-                        module=module, module_type=module_type
+                        module=module, module_type='mlp'
                     )
 
                     if len(prune_idx) == 0:
                         logger.info(f"No pruning needed for {step.layer_name}")
                         continue
 
-                    if target_type == 'mlp':
-                        compensation = self.compensator.fit(stats, prune_idx, surv_idx)
-                        self.mask_applier.prune_ffn_intermediate(
-                            module, prune_idx,
-                            compensation=None if skip_compensation else compensation
-                        )
-                        comp_lambda = compensation.lambda_used
-                        comp_cond = compensation.condition_number
-                        del compensation
-                    else:
-                        # Head-mode attention pruning
-                        self.mask_applier.prune_attention_heads(module, prune_idx)
-                        comp_lambda = 0.0
-                        comp_cond = 0.0
+                    compensation = self.compensator.fit(stats, prune_idx, surv_idx)
+                    self.mask_applier.prune_ffn_intermediate(
+                        module, prune_idx,
+                        compensation=None if skip_compensation else compensation
+                    )
+                    comp_lambda = compensation.lambda_used
+                    comp_cond = compensation.condition_number
+                    del compensation
 
                     prune_count = len(prune_idx)
                     survivor_count = len(surv_idx)
@@ -424,32 +379,19 @@ class PruneRunner:
         model: nn.Module,
         loader: DataLoader,
         structure: Dict,
-        attn_prune_mode: str = 'head',
         target_override: Optional[str] = None,
     ) -> Dict:
-        """Collect activations from model.
-
-        Args:
-            model: The model to collect activations from
-            loader: Data loader for calibration data
-            structure: Model structure info
-            attn_prune_mode: Mode for attention pruning
-            target_override: If set, override the pruning target for collection
-                (e.g. 'both' to collect all stats for caching)
-        """
-        # Determine hook points
+        """Collect activations from model."""
         target = target_override if target_override is not None else self.pruning_config.target.value
-        hook_points = get_hook_points(model, target, attn_prune_mode)
+        hook_points = get_hook_points(model, target)
 
-        # Warn if dim-logit mode requires exact covariance but user specified otherwise
-        if attn_prune_mode == 'dim-logit':
-            user_cov_mode = self.collector_config.covariance_mode
-            user_cov_value = user_cov_mode.value if hasattr(user_cov_mode, 'value') else user_cov_mode
-            if user_cov_value != 'exact':
-                logger.warning(
-                    f"dim-logit mode requires exact covariance for Sylvester solver. "
-                    f"Overriding covariance_mode from '{user_cov_value}' to 'exact'."
-                )
+        user_cov_mode = self.collector_config.covariance_mode
+        user_cov_value = user_cov_mode.value if hasattr(user_cov_mode, 'value') else user_cov_mode
+        if user_cov_value != 'exact':
+            logger.warning(
+                f"Attention dim-logit requires exact covariance for Sylvester solver. "
+                f"Overriding covariance_mode from '{user_cov_value}' to 'exact'."
+            )
 
         # Compensation uses covariance/mean, not raw activations
         config = CollectorConfig(
@@ -460,7 +402,7 @@ class PruneRunner:
         )
 
         collector = ActivationCollector(model, config, device=self.device)
-        collector.register_hooks(hook_points, model_structure=structure, attn_prune_mode=attn_prune_mode)
+        collector.register_hooks(hook_points, model_structure=structure)
 
         n_samples = 0
         max_samples = self.runner_config.calib_samples
@@ -484,25 +426,15 @@ class PruneRunner:
         return collector.get_all_stats()
 
     def _get_layer_dims(self, model: nn.Module, structure: Dict) -> Dict[str, int]:
-        """Get dimensions of prunable layers based on target type.
+        """Get dimensions of prunable layers.
 
-        Args:
-            model: The model to analyze
-            structure: Model structure info
-
-        Returns:
-            For MLP target: Dict mapping block names to MLP hidden dimensions
-            For ATTN target (head mode): Dict mapping block names to number of attention heads
-            For ATTN target (dim-logit): Dict mapping block names to head_dim (Q/K dims per head)
-            For BOTH target: Dict with both MLP and ATTN entries (suffixed)
+        For MLP: block name -> intermediate hidden dim.
+        For ATTN (dim-logit): block name -> per-head dim.
+        For BOTH: both entries suffixed with .mlp / .attn.
         """
         layer_dims = {}
         target = self.pruning_config.target
         target_value = target.value if hasattr(target, 'value') else target
-
-        # Get attention prune mode
-        attn_mode = self.pruning_config.attn_prune_mode
-        attn_mode_value = attn_mode.value if hasattr(attn_mode, 'value') else attn_mode
 
         for i in range(structure['num_blocks']):
             block_name = f"blocks.{i}"
@@ -511,27 +443,20 @@ class PruneRunner:
             if block is None:
                 continue
 
-            # MLP dimensions
             if target_value in ('mlp', 'both'):
                 if hasattr(block, 'mlp') and detect_mlp_type(block.mlp) != 'unknown':
                     key = f"{block_name}.mlp" if target_value == 'both' else block_name
                     layer_dims[key] = get_mlp_intermediate_dim(block.mlp)
 
-            # Attention dimensions
             if target_value in ('attn', 'both'):
                 if hasattr(block, 'attn') and hasattr(block.attn, 'num_heads'):
                     key = f"{block_name}.attn" if target_value == 'both' else block_name
-                    # For dim-logit, use head_dim; for head mode, use num_heads
-                    if attn_mode_value == 'dim-logit':
-                        attn = block.attn
-                        if hasattr(attn, 'head_dim'):
-                            layer_dims[key] = attn.head_dim
-                        else:
-                            # DINOv2 MemEffAttention: compute from qkv weight
-                            embed_dim = attn.qkv.weight.shape[1] if hasattr(attn, 'qkv') else attn.proj.weight.shape[0]
-                            layer_dims[key] = embed_dim // attn.num_heads
+                    attn = block.attn
+                    if hasattr(attn, 'head_dim'):
+                        layer_dims[key] = attn.head_dim
                     else:
-                        layer_dims[key] = block.attn.num_heads
+                        embed_dim = attn.qkv.weight.shape[1] if hasattr(attn, 'qkv') else attn.proj.weight.shape[0]
+                        layer_dims[key] = embed_dim // attn.num_heads
 
         return layer_dims
 

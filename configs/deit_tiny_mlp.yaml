@@ -1,0 +1,49 @@
+# Prune the MLP channels of DeiT-tiny on ImageNet.
+# Smallest / fastest sanity-check config.
+
+model:
+  source: timm
+  name: deit_tiny_patch16_224
+  checkpoint: null
+  pretrained: true
+
+task: imagenet_classification
+
+dataset:
+  calib_path: data/imagenet-mini/val
+  val_path: data/imagenet-mini/val
+  calib_samples: 1024
+  batch_size: 32
+  num_workers: 4
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+  force_recollect: false
+
+pruning:
+  target: mlp
+  schedule: layerwise
+  sparsity: 0.3
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  auto_shrinkage: true
+  min_channels: 64
+  min_heads: 1
+  min_qk_dim: 8
+  qk_sparsity: 0.3
+  keep_topk_outliers: 0
+
+collector:
+  covariance_mode: exact
+  sketch_dim: 256
+  store_raw: false
+  subsample_tokens: null
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  save_pruned_path: null
+  calib_samples: 1024

@@ -19,34 +19,31 @@ from .stats import QKDimReport
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def compute_cache_key(
     model_name: str,
     calib_samples: int,
-    attn_mode: str,
     subsample_tokens: Optional[int],
 ) -> str:
     """Compute a deterministic cache key for the given configuration.
 
-    The cache key depends only on factors that affect which activations are
-    collected and their values: model, data size, attention mode, and token
-    subsampling.  It is intentionally independent of ranker and pruning target
-    so that the same cached stats can be reused across different experiments.
-    Activations are always collected for *both* MLP and attention layers.
+    Cache depends only on factors that affect which activations are collected:
+    model, data size, and token subsampling. Independent of ranker/target so
+    the same stats can be reused across experiments. Activations are always
+    collected for both MLP and attention layers.
     """
     parts = [
         str(CACHE_VERSION),
         model_name,
         str(calib_samples),
-        attn_mode,
         str(subsample_tokens),
     ]
     raw = "|".join(parts)
     h = hashlib.sha256(raw.encode()).hexdigest()[:16]
     safe_name = model_name.replace("/", "_")
-    return f"{safe_name}_{attn_mode}_{h}"
+    return f"{safe_name}_{h}"
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,43 @@
+# Sparsity / ranker sweep over DeiT-tiny. Runs the cartesian product and
+# caches each cell's report in cache/experiments/deit_sweep.json.
+
+model:
+  source: timm
+  name: deit_tiny_patch16_224
+  pretrained: true
+
+task: imagenet_classification
+
+dataset:
+  calib_path: data/imagenet-mini/val
+  val_path: data/imagenet-mini/val
+  calib_samples: 1024
+  batch_size: 32
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+
+pruning:
+  target: mlp
+  schedule: layerwise
+  sparsity: 0.3
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  min_channels: 64
+
+collector:
+  covariance_mode: exact
+  store_raw: false
+
+runner:
+  device: cuda
+  seed: 42
+  output_dir: logs
+  calib_samples: 1024
+
+experiment:
+  sweep:
+    pruning.sparsity: [0.1, 0.2, 0.3, 0.4]
+    pruning.ranker: [energy, active_energy]
+  result_cache: cache/experiments/deit_sparsity_sweep.json

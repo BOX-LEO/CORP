@@ -1,0 +1,38 @@
+# Prune OPT-125m MLP channels; calibrate on C4, evaluate perplexity on WikiText-2.
+
+model:
+  source: hf_opt
+  name: "125m"
+  pretrained: true
+
+task: language_modeling
+
+dataset:
+  n_calib_segments: 128
+  seq_len: 2048
+  batch_size: 4
+  seed: 42
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+
+pruning:
+  target: both
+  schedule: global
+  sparsity: 0.3
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  min_channels: 64
+  min_heads: 1
+
+collector:
+  covariance_mode: exact
+  store_raw: false
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  calib_samples: 128

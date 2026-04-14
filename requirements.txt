@@ -1,0 +1,15 @@
+# Core
+torch>=2.0
+torchvision>=0.15
+numpy
+pyyaml
+tqdm
+Pillow
+
+# Model loaders
+timm>=0.9               # ViT / DeiT
+transformers>=4.30      # OPT
+datasets>=2.10          # C4 + WikiText-2 streaming
+
+# DINOv2 DPT head is pulled via torch.hub at runtime (no extra dep here).
+# fvcore only needed if you reintroduce FLOPs analysis.

@@ -153,25 +153,17 @@ class ActivationCollector:
         self,
         layer_names: List[str],
         model_structure: Optional[Dict] = None,
-        attn_prune_mode: str = 'head',
     ) -> None:
-        """Register forward hooks on specified layers.
-
-        Args:
-            layer_names: List of layer names to hook (e.g., 'blocks.0.mlp.fc1')
-            model_structure: Optional model structure dict with num_heads, head_dim, qk_dim
-            attn_prune_mode: Mode for attention pruning ('head' or 'dim-logit')
-        """
+        """Register forward hooks on specified layers."""
         self.clear_hooks()
 
-        # Get model structure for attention head dimensions
         if model_structure is None:
             model_structure = detect_model_structure(self.model)
 
         num_heads = model_structure.get('num_heads', 12)
         embed_dim = model_structure.get('embed_dim', 768)
         head_dim = model_structure.get('head_dim', embed_dim // num_heads if num_heads > 0 else 64)
-        qk_dim = model_structure.get('qk_dim', head_dim)  # Q/K dim (may differ from V dim after pruning)
+        qk_dim = model_structure.get('qk_dim', head_dim)
 
         logger.debug(f"register_hooks: head_dim={head_dim}, qk_dim={qk_dim}, model_structure={model_structure}")
 
@@ -181,23 +173,14 @@ class ActivationCollector:
                 logger.warning(f"Module {name} not found, skipping")
                 continue
 
-            # Determine hook type based on module
             if name.endswith('.mlp'):
-                # Hook to capture input to MLP
                 hook = self._create_input_hook(name)
             elif name.endswith('.mlp.w3') or name.endswith('.mlp.down_proj'):
-                # SwiGLU: input hook on down projection captures intermediate activations
                 hook = self._create_input_hook(name)
-            elif name.endswith('.attn.qkv') and attn_prune_mode == 'dim-logit':
-                # Hook to capture Q/K per-head per-dim statistics for dim pruning
-                # Extract base attention layer name (e.g., 'blocks.0.attn' from 'blocks.0.attn.qkv')
-                attn_name = name[:-4]  # Remove '.qkv'
+            elif name.endswith('.attn.qkv'):
+                attn_name = name[:-4]
                 hook = self._create_qk_dim_hook(attn_name, num_heads, qk_dim, head_dim)
-            elif name.endswith('.attn.proj'):
-                # Hook to capture attention head statistics
-                hook = self._create_attn_head_hook(name, num_heads, head_dim)
             else:
-                # Hook to capture output
                 hook = self._create_output_hook(name)
 
             handle = module.register_forward_hook(hook)
@@ -241,62 +224,6 @@ class ActivationCollector:
             if not self._collecting:
                 return
             self._process_activation(layer_name, output)
-        return hook
-
-    def _create_attn_head_hook(self, layer_name: str, num_heads: int, head_dim: int) -> Callable:
-        """Create a hook that captures per-head attention statistics.
-
-        For attention head pruning, we want to compute importance per head,
-        not per feature. This hook reshapes the input to (batch, seq_len, num_heads, head_dim)
-        and computes per-head statistics.
-
-        Args:
-            layer_name: Name of the attention layer
-            num_heads: Number of attention heads
-            head_dim: Dimension per head
-        """
-        def hook(module: nn.Module, inputs, output):
-            if not self._collecting:
-                return
-
-            # Input to proj is (batch, seq_len, num_heads * head_dim)
-            x = inputs[0] if isinstance(inputs, tuple) else inputs
-            x = x.detach()
-
-            batch_size, seq_len, embed_dim = x.shape
-            assert embed_dim == num_heads * head_dim, \
-                f"Expected embed_dim={num_heads}*{head_dim}={num_heads*head_dim}, got {embed_dim}"
-
-            # Reshape to (batch, seq_len, num_heads, head_dim)
-            x = x.view(batch_size, seq_len, num_heads, head_dim)
-
-            # Token subsampling
-            if self.config.subsample_tokens is not None:
-                n_keep = min(self.config.subsample_tokens, seq_len)
-                if self.config.keep_cls_token and n_keep > 1:
-                    cls_token = x[:, 0:1, :, :]
-                    other_tokens = x[:, 1:, :, :]
-                    n_sample_others = n_keep - 1
-                    if n_sample_others > 0 and other_tokens.shape[1] > 0:
-                        indices = torch.randperm(other_tokens.shape[1])[:n_sample_others]
-                        sampled_others = other_tokens[:, indices, :, :]
-                        x = torch.cat([cls_token, sampled_others], dim=1)
-                    else:
-                        x = cls_token
-                else:
-                    indices = torch.randperm(seq_len)[:n_keep]
-                    x = x[:, indices, :, :]
-
-            # Compute per-head L2 norm (sum of squared activations across head_dim)
-            # Shape: (batch, seq_len, num_heads)
-            x_head_norm = (x ** 2).sum(dim=-1)
-
-            # Flatten to (n_tokens, num_heads) for statistics
-            x_head_norm = x_head_norm.reshape(-1, num_heads)
-
-            # Process like regular activation but with num_heads as feature_dim
-            self._process_activation_raw(layer_name, x_head_norm, is_head_stat=True)
-
         return hook
 
     def _create_qk_dim_hook(self, layer_name: str, num_heads: int, qk_dim: int, v_dim: int) -> Callable:
@@ -807,16 +734,12 @@ def detect_model_structure(model: nn.Module) -> Dict:
     return info
 
 
-def get_hook_points(model: nn.Module, target: str = 'mlp', attn_prune_mode: str = 'head') -> List[str]:
+def get_hook_points(model: nn.Module, target: str = 'mlp') -> List[str]:
     """Get hook point names for the model.
 
     Args:
         model: The model to analyze
         target: 'mlp', 'attn', or 'both'
-        attn_prune_mode: Mode for attention pruning ('head' or 'dim-logit')
-
-    Returns:
-        List of module names to hook
     """
     info = detect_model_structure(model)
     points = []
@@ -825,24 +748,15 @@ def get_hook_points(model: nn.Module, target: str = 'mlp', attn_prune_mode: str 
 
     for i in range(info['num_blocks']):
         if target in ('mlp', 'both'):
-            # Hook MLP input (for input stats) and intermediate activations
             points.append(f'blocks.{i}.mlp')
             if mlp_type == 'standard':
-                # Output hook on activation module
                 points.append(f'blocks.{i}.mlp.act')
             elif mlp_type == 'swiglu_fused':
-                # Input hook on down projection (w3) captures silu(gate)*up
                 points.append(f'blocks.{i}.mlp.w3')
             elif mlp_type == 'swiglu_split':
-                # Input hook on down projection captures silu(gate)*up
                 points.append(f'blocks.{i}.mlp.down_proj')
 
         if target in ('attn', 'both'):
-            if attn_prune_mode == 'dim-logit':
-                # Hook QKV output for Q/K dimension pruning
-                points.append(f'blocks.{i}.attn.qkv')
-            else:
-                # Hook attention output projection for head pruning
-                points.append(f'blocks.{i}.attn.proj')
+            points.append(f'blocks.{i}.attn.qkv')
 
     return points

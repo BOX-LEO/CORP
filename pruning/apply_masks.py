@@ -18,45 +18,6 @@ from .collect import detect_mlp_type
 logger = logging.getLogger(__name__)
 
 
-def _make_pruned_attention_forward(attn):
-    """Create a patched forward method for pruned attention.
-
-    The original timm Attention.forward uses input shape C for reshape,
-    which breaks when num_heads is reduced. This patched version uses
-    the actual number of heads and head_dim.
-    """
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        B, N, C = x.shape
-        head_dim = self.head_dim if hasattr(self, 'head_dim') else C // self.num_heads
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        if hasattr(self, 'q_norm') and self.q_norm is not None:
-            q, k = self.q_norm(q), self.k_norm(k)
-
-        fused = getattr(self, 'fused_attn', False)
-        if fused:
-            dropout_p = self.attn_drop.p if callable(self.attn_drop) else self.attn_drop
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=dropout_p if self.training else 0.,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            if callable(self.attn_drop):
-                attn = self.attn_drop(attn)
-            x = attn @ v
-
-        # Use -1 to infer the correct size instead of hardcoded C
-        x = x.transpose(1, 2).reshape(B, N, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-    return types.MethodType(forward, attn)
-
-
 def _make_qk_dim_pruned_attention_forward(attn, qk_dim: int, v_dim: int, num_heads: int):
     """Create a patched forward method for Q/K dimension pruned attention.
 
@@ -446,102 +407,6 @@ class MaskApplier:
 
         return W_tilde, b_tilde
 
-    def prune_attention_heads(
-        self,
-        attn: nn.Module,
-        prune_head_indices: torch.Tensor,
-    ) -> nn.Module:
-        """Prune attention heads.
-
-        Prunes entire heads from QKV projections and output projection.
-
-        Args:
-            attn: Attention module
-            prune_head_indices: Indices of heads to prune
-
-        Returns:
-            Modified attention module
-        """
-        if not hasattr(attn, 'qkv') or not hasattr(attn, 'proj'):
-            raise ValueError("Attention must have qkv and proj attributes")
-
-        n_heads = attn.num_heads
-        head_dim = attn.head_dim if hasattr(attn, 'head_dim') else attn.qkv.out_features // (3 * n_heads)
-
-        n_prune = len(prune_head_indices)
-        if n_prune == 0:
-            return attn
-
-        # Compute survivor head indices
-        all_heads = set(range(n_heads))
-        prune_set = set(prune_head_indices.tolist())
-        survivor_heads = torch.tensor(sorted(all_heads - prune_set), dtype=torch.long)
-        n_survivors = len(survivor_heads)
-
-        logger.info(
-            f"Pruning attention heads: {n_heads} -> {n_survivors} "
-            f"({n_prune} pruned)"
-        )
-
-        # Compute feature indices for QKV
-        # QKV layout: [Q_h0, Q_h1, ..., K_h0, K_h1, ..., V_h0, V_h1, ...]
-        def head_to_feature_indices(head_indices: torch.Tensor) -> torch.Tensor:
-            """Convert head indices to feature indices in QKV."""
-            indices = []
-            for offset in [0, n_heads, 2 * n_heads]:  # Q, K, V sections
-                for h in head_indices:
-                    start = (offset + h) * head_dim
-                    indices.extend(range(start, start + head_dim))
-            return torch.tensor(indices, dtype=torch.long)
-
-        survivor_qkv_indices = head_to_feature_indices(survivor_heads)
-
-        # Create new QKV projection
-        new_qkv = nn.Linear(
-            attn.qkv.in_features,
-            n_survivors * head_dim * 3,
-            bias=attn.qkv.bias is not None,
-            device=attn.qkv.weight.device,
-            dtype=attn.qkv.weight.dtype,
-        )
-
-        with torch.no_grad():
-            new_qkv.weight.copy_(attn.qkv.weight[survivor_qkv_indices, :])
-            if attn.qkv.bias is not None:
-                new_qkv.bias.copy_(attn.qkv.bias[survivor_qkv_indices])
-
-        # Create new output projection
-        # proj input: concat of V outputs from all heads
-        survivor_proj_in_indices = []
-        for h in survivor_heads:
-            start = h * head_dim
-            survivor_proj_in_indices.extend(range(start, start + head_dim))
-        survivor_proj_in_indices = torch.tensor(survivor_proj_in_indices, dtype=torch.long)
-
-        new_proj = nn.Linear(
-            n_survivors * head_dim,
-            attn.proj.out_features,
-            bias=attn.proj.bias is not None,
-            device=attn.proj.weight.device,
-            dtype=attn.proj.weight.dtype,
-        )
-
-        with torch.no_grad():
-            new_proj.weight.copy_(attn.proj.weight[:, survivor_proj_in_indices])
-            if attn.proj.bias is not None:
-                new_proj.bias.copy_(attn.proj.bias)
-
-        # Update attention module
-        attn.qkv = new_qkv
-        attn.proj = new_proj
-        attn.num_heads = n_survivors
-
-        # Patch the forward method to handle reduced heads
-        # The original forward uses input shape C for reshape which breaks
-        attn.forward = _make_pruned_attention_forward(attn)
-
-        return attn
-
     def prune_attention_qk_dims(
         self,
         attn: nn.Module,
@@ -696,57 +561,6 @@ class MaskApplier:
         )
 
         return attn
-
-    def create_pruned_model_copy(
-        self,
-        model: nn.Module,
-        prune_plan: dict,
-    ) -> nn.Module:
-        """Create a pruned copy of the model.
-
-        Args:
-            model: Original model
-            prune_plan: Dictionary mapping layer names to prune indices
-
-        Returns:
-            New model with pruned layers
-        """
-        # Deep copy the model
-        pruned_model = copy.deepcopy(model)
-
-        # Handle compiled models
-        if hasattr(pruned_model, '_orig_mod'):
-            pruned_model = pruned_model._orig_mod
-
-        # Apply pruning to each layer
-        for layer_name, prune_indices in prune_plan.items():
-            if len(prune_indices) == 0:
-                continue
-
-            # Get the module
-            parts = layer_name.split('.')
-            module = pruned_model
-            for part in parts[:-1]:
-                if part.isdigit():
-                    module = module[int(part)]
-                else:
-                    module = getattr(module, part)
-
-            last_part = parts[-1]
-            target = getattr(module, last_part) if not last_part.isdigit() else module[int(last_part)]
-
-            # Determine pruning type and apply
-            if detect_mlp_type(target) != 'unknown':
-                # MLP (standard, swiglu_fused, or swiglu_split)
-                self.prune_ffn_intermediate(target, prune_indices)
-            elif hasattr(target, 'qkv') and hasattr(target, 'proj'):
-                # Attention
-                self.prune_attention_heads(target, prune_indices)
-            else:
-                logger.warning(f"Unknown module type for {layer_name}, skipping")
-
-        return pruned_model
-
 
 def get_model_parameter_count(model: nn.Module) -> int:
     """Get total parameter count of a model."""

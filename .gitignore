@@ -1,1 +1,30 @@
+# Byte-compiled / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Data + artifacts — all user-supplied, not in repo
+data/
+logs/
+cache/
+*.pt
+*.pth
+*.safetensors
+
+# Local-only doc
 CLAUDE.md
+
+# DINOv2 pretrained head weights (bulky; ship separately)
+model/heads/*.pth

@@ -1,0 +1,44 @@
+# Prune DINOv2-base MLP channels and evaluate on NYU Depth V2 (depth
+# estimation) and optionally ADE20k (segmentation). Requires head .pth
+# files under `model/heads/` — see README for download instructions.
+
+model:
+  source: torch_hub_dinov2
+  name: base
+  # heads_dir: model/heads            # optional override
+  pretrained: true
+
+task: dinov2_vision
+
+dataset:
+  nyu_path: data/nyu_v2
+  ade_path: data/ade20k/ADEChallengeData2016
+  use_ade: true
+  nyu_samples: 3000
+  ade_samples: 3000
+  batch_size: 8
+  num_workers: 4
+  image_size: 518
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+
+pruning:
+  target: mlp
+  schedule: layerwise
+  sparsity: 0.3
+  ranker: active_energy
+  lambda_reg: 1.0e-3
+  min_channels: 128
+
+collector:
+  covariance_mode: exact   # required for DINOv2 SwiGLU fused MLP
+  store_raw: false
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  calib_samples: 1024
