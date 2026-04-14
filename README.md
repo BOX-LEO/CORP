@@ -4,6 +4,8 @@ One-shot structured pruning with closed-form compensation. A single generic
 pipeline (`pruning/`) drives four model families (DeiT/ViT, DINOv2, OPT) via
 a task-registry architecture and YAML configs.
 
+paper is avilable in [arxiv](https://arxiv.org/abs/2602.05243).
+
 ## Install
 
 ```bash
@@ -81,9 +83,22 @@ weights under `model/heads/`:
 
 Written under `cache/` (relative to the YAML unless absolute). Safe to delete.
 
-- `cache/baselines/baseline.json` — model baseline metrics keyed by `model|val_path|task`.
+- `cache/baselines/baseline.json` — per model/val/task entry of the form
+  `{"metrics": {...}, "num_params": N, "flops": F}`. Legacy flat-metrics
+  entries are upgraded in place on next run.
 - `cache/stats/*.pkl` — activation statistics; re-collection is deterministic.
-- `cache/experiments/*.json` — sweep results keyed by override signature.
+- `cache/experiments/*.json` — sweep results keyed by override signature
+  (`run_experiments.py`).
+- `cache/experiments/results_log.json` — flat per-run log written by every
+  `run_prune.py` / `run_experiments.py` invocation. One entry per run keyed
+  by a signature (sweep overrides or single-run config), containing the
+  effective config, baseline/pruned metrics, param counts, FLOPs, and
+  compression/FLOP reduction ratios. Path configurable via
+  `runner.results_log` in the YAML.
+
+FLOPs are reported as 2× MACs. Vision models use `fvcore.nn.FlopCountAnalysis`
+with a custom `scaled_dot_product_attention` handler; OPT uses an analytical
+layer-walk (so pruned models count correctly without re-tracing).
 
 ## YAML reference
 
@@ -95,7 +110,20 @@ See `configs/deit_tiny_mlp.yaml` for a minimal example. Supported blocks:
 - `cache`: `baseline_dir`, `stats_dir`, `experiments_dir`, `force_recollect`.
 - `pruning`: `target`, `schedule`, `sparsity` (or `mlp_sparsity`+`attn_sparsity`), `ranker`, `lambda_reg`, `min_channels`, `min_heads` (OPT attn only), `min_qk_dim`, `qk_sparsity`. Generic attention pruning is always dim-logit; OPT uses head pruning.
 - `collector`: `covariance_mode`, `sketch_dim`, `store_raw`, `subsample_tokens`.
-- `runner`: `device`, `dtype`, `seed`, `output_dir`, `save_pruned_path`, `calib_samples`.
+- `runner`: `device`, `dtype`, `seed`, `save_pruned_path`, `calib_samples`, `results_log`.
 - `experiment`: sweep + `result_cache` (only for `run_experiments.py`).
 
 Paths in the YAML resolve relative to the YAML file's directory.
+
+## Citation
+```
+@misc{zhang2026corpclosedformoneshotrepresentationpreserving,
+      title={CORP: Closed-Form One-shot Representation-Preserving Structured Pruning for Vision Transformers}, 
+      author={Boxiang Zhang and Baijian Yang},
+      year={2026},
+      eprint={2602.05243},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2602.05243}, 
+}
+```

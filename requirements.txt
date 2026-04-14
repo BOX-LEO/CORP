@@ -12,4 +12,6 @@ transformers>=4.30      # OPT
 datasets>=2.10          # C4 + WikiText-2 streaming
 
 # DINOv2 DPT head is pulled via torch.hub at runtime (no extra dep here).
-# fvcore only needed if you reintroduce FLOPs analysis.
+
+# FLOP counting for vision models (OPT uses an analytical path, no fvcore needed).
+fvcore>=0.1.5

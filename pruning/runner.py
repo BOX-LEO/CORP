@@ -10,9 +10,7 @@ from torch.utils.data import DataLoader
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from pathlib import Path
-import json
 import logging
-from datetime import datetime
 import copy
 import gc
 
@@ -26,7 +24,7 @@ from .ranking import StructureRanker, RankingPolicy, QKDimRanker
 from .compensate import AffineCompensator, CompensationResult, QKDimCompensator
 from .apply_masks import MaskApplier, compare_model_sizes
 from .diagnostics import DiagnosticsChecker, run_quick_validation
-from .schedules import PruneSchedule, create_schedule, PruneStep
+from .schedules import PruneSchedule, create_schedule
 from .cache import compute_cache_key, save_stats_cache, load_stats_cache
 
 logger = logging.getLogger(__name__)
@@ -58,7 +56,6 @@ class RunResult:
     step_results: List[StepResult] = field(default_factory=list)
     final_cosine: Optional[float] = None
     error_message: Optional[str] = None
-    output_dir: Optional[Path] = None
     pruned_model: Optional[nn.Module] = None  # The pruned model
 
 
@@ -126,14 +123,6 @@ class PruneRunner:
         Returns:
             RunResult with pruning outcomes (includes pruned_model)
         """
-        # Set up output directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = self.runner_config.output_dir / f"run_{timestamp}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save config
-        self._save_config(output_dir)
-
         # Handle compiled models
         if hasattr(model, '_orig_mod'):
             model = model._orig_mod
@@ -162,7 +151,6 @@ class PruneRunner:
         torch.cuda.empty_cache()
 
         step_results = []
-        metrics_file = output_dir / "metrics.jsonl"
 
         try:
             target = self.pruning_config.target
@@ -308,9 +296,6 @@ class PruneRunner:
                 )
                 step_results.append(result)
 
-                # Log to file
-                self._log_step(metrics_file, step, result)
-
                 logger.info(
                     f"Pruned {step.layer_name} ({target_type}): {result.prune_count} pruned, "
                     f"{result.survivor_count} remaining"
@@ -348,20 +333,14 @@ class PruneRunner:
                 torch.save(pruned_model.state_dict(), self.runner_config.save_pruned_path)
                 logger.info(f"Saved pruned model to {self.runner_config.save_pruned_path}")
 
-            # Generate summary
-            result = RunResult(
+            return RunResult(
                 success=True,
                 original_params=original_params,
                 pruned_params=pruned_params,
                 compression_ratio=original_params / pruned_params,
                 step_results=step_results,
-                output_dir=output_dir,
                 pruned_model=pruned_model,
             )
-
-            self._save_summary(output_dir, result)
-
-            return result
 
         except Exception as e:
             logger.error(f"Pruning failed: {e}")
@@ -371,7 +350,6 @@ class PruneRunner:
                 pruned_params=original_params,
                 compression_ratio=1.0,
                 error_message=str(e),
-                output_dir=output_dir,
             )
 
     def _collect_activations(
@@ -669,64 +647,3 @@ class PruneRunner:
 
         return (prune_per_head, surv_per_head)
 
-    def _save_config(self, output_dir: Path) -> None:
-        """Save configuration to file."""
-        config_file = output_dir / "config.json"
-        config_dict = {
-            'collector': {
-                'target': self.collector_config.target.value,
-                'subsample_tokens': self.collector_config.subsample_tokens,
-                'covariance_mode': self.collector_config.covariance_mode.value,
-            },
-            'pruning': {
-                'target': self.pruning_config.target.value,
-                'schedule': self.pruning_config.schedule.value,
-                'sparsity': self.pruning_config.sparsity,
-                'ranker': self.pruning_config.ranker.value,
-                'lambda_reg': self.pruning_config.lambda_reg,
-                'min_channels': self.pruning_config.min_channels,
-            },
-            'runner': {
-                'device': self.runner_config.device,
-                'dtype': self.runner_config.dtype,
-                'calib_samples': self.runner_config.calib_samples,
-            },
-        }
-        with open(config_file, 'w') as f:
-            json.dump(config_dict, f, indent=2)
-
-    def _log_step(self, file_path: Path, step: PruneStep, result: StepResult) -> None:
-        """Log step to JSONL file."""
-        entry = {
-            'round': step.round_num,
-            'step': step.step_num,
-            'layer': result.layer_name,
-            'target_type': result.target_type,
-            'prune_count': result.prune_count,
-            'survivor_count': result.survivor_count,
-            'sparsity': result.sparsity,
-            'lambda': result.compensation_lambda,
-            'condition_number': result.compensation_cond,
-        }
-        with open(file_path, 'a') as f:
-            f.write(json.dumps(entry) + '\n')
-
-    def _save_summary(self, output_dir: Path, result: RunResult) -> None:
-        """Save run summary."""
-        summary_file = output_dir / "summary.md"
-        with open(summary_file, 'w') as f:
-            f.write("# Pruning Run Summary\n\n")
-            f.write(f"- Success: {result.success}\n")
-            f.write(f"- Target: {self.pruning_config.target.value}\n")
-            f.write(f"- Original params: {result.original_params:,}\n")
-            f.write(f"- Pruned params: {result.pruned_params:,}\n")
-            f.write(f"- Compression ratio: {result.compression_ratio:.2f}x\n")
-            f.write(f"- Steps completed: {len(result.step_results)}\n")
-
-            if result.error_message:
-                f.write(f"\n## Error\n{result.error_message}\n")
-
-            f.write("\n## Step Details\n\n")
-            for step in result.step_results:
-                f.write(f"- {step.layer_name} [{step.target_type}]: {step.prune_count} pruned "
-                       f"({step.sparsity*100:.1f}%)\n")

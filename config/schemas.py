@@ -68,6 +68,7 @@ class RunnerConfig:
     device: str = "cuda"
     output_dir: Path = field(default_factory=lambda: Path("logs"))
     save_pruned_path: Optional[Path] = None
+    results_log: Optional[Path] = None
     calib_samples: int = 1024
     dtype: str = "float32"
     seed: int = 42

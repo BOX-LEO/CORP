@@ -167,6 +167,7 @@ def load_yaml_config(
         device=str(r.get("device", "cuda")),
         output_dir=_resolve_path(r.get("output_dir", "logs"), base_dir),
         save_pruned_path=_resolve_path(r.get("save_pruned_path"), base_dir),
+        results_log=_resolve_path(r.get("results_log", "cache/experiments/results_log.json"), base_dir),
         calib_samples=int(r.get("calib_samples", raw.get("dataset", {}).get("calib_samples", 1024))),
         dtype=str(r.get("dtype", "float32")),
         seed=int(r.get("seed", 42)),

@@ -28,6 +28,8 @@ from model import load_model
 from pruning.runner import PruneRunner, RunResult
 
 from . import baseline_cache
+from . import flops as flops_mod
+from . import results_log
 from .opt_pipeline import OPTRunResult, run_opt_prune
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,9 @@ class PruneReport:
     original_params: int = 0
     pruned_params: int = 0
     compression_ratio: float = 1.0
+    original_flops: Optional[int] = None
+    pruned_flops: Optional[int] = None
+    flops_reduction: Optional[float] = None
     output_dir: Optional[Path] = None
     step_results: List[Any] = field(default_factory=list)
     success: bool = True
@@ -240,9 +245,9 @@ def run_prune(
         eval_kwargs["depth_model_factory"] = depth_factory
         eval_kwargs["seg_model_factory"] = seg_factory
 
-    # Baseline.
+    # Baseline (plus original param/FLOP counts, cached alongside metrics).
     val_desc = _val_descriptor(task_cfg)
-    baseline = baseline_cache.get_or_compute(
+    baseline_entry = baseline_cache.get_or_compute(
         baseline_dir=task_cfg.cache["baseline_dir"],
         model_name=name,
         val_descriptor=val_desc,
@@ -251,8 +256,13 @@ def run_prune(
             task_cfg.task, model, loaders, device,
             **{k: v for k, v in eval_kwargs.items() if k != "original_model"},
         ),
+        count_params_fn=lambda: flops_mod.count_params(model),
+        count_flops_fn=lambda: flops_mod.flops_for_model(model, meta, task_cfg, loaders["calib"]),
     )
-    logger.info(f"Baseline: {baseline}")
+    baseline = baseline_entry["metrics"]
+    orig_params = baseline_entry["num_params"]
+    orig_flops = baseline_entry["flops"]
+    logger.info(f"Baseline: {baseline}  params={orig_params}  flops={orig_flops}")
 
     # Run pruning.
     logger.info("=" * 60)
@@ -269,16 +279,19 @@ def run_prune(
 
     if not getattr(result, "success", True):
         logger.error(f"Pruning failed: {getattr(result, 'error_message', 'unknown')}")
-        return PruneReport(
+        failed = PruneReport(
             task=task_cfg.task, model_name=name,
             baseline=baseline,
-            original_params=getattr(result, "original_params", 0),
+            original_params=getattr(result, "original_params", 0) or (orig_params or 0),
             pruned_params=getattr(result, "pruned_params", 0),
             compression_ratio=getattr(result, "compression_ratio", 1.0),
+            original_flops=orig_flops,
             success=False,
             error_message=getattr(result, "error_message", None),
             output_dir=getattr(result, "output_dir", None),
         )
+        _append_results_log(full_cfg, task_cfg, meta, failed, overrides)
+        return failed
 
     pruned_model = result.pruned_model
 
@@ -311,6 +324,12 @@ def run_prune(
             task_cfg.task, r2.pruned_model, loaders, device, **eval_kwargs,
         )
 
+    # Pruned FLOPs on the live pruned model.
+    pruned_flops = flops_mod.flops_for_model(pruned_model, meta, task_cfg, loaders["calib"])
+    flops_reduction = None
+    if orig_flops and pruned_flops:
+        flops_reduction = orig_flops / pruned_flops
+
     report = PruneReport(
         task=task_cfg.task,
         model_name=name,
@@ -320,11 +339,15 @@ def run_prune(
         original_params=result.original_params,
         pruned_params=result.pruned_params,
         compression_ratio=result.compression_ratio,
+        original_flops=orig_flops,
+        pruned_flops=pruned_flops,
+        flops_reduction=flops_reduction,
         output_dir=getattr(result, "output_dir", None),
         step_results=list(getattr(result, "step_results", []) or []),
         success=True,
     )
     _print_summary(report)
+    _append_results_log(full_cfg, task_cfg, meta, report, overrides)
     return report
 
 
@@ -336,9 +359,83 @@ def _print_summary(r: PruneReport) -> None:
     logger.info(f"Original params: {r.original_params:,}")
     logger.info(f"Pruned params:   {r.pruned_params:,}")
     logger.info(f"Compression:     {r.compression_ratio:.2f}x")
+    if r.original_flops is not None:
+        logger.info(f"Original FLOPs:  {r.original_flops:,}")
+    if r.pruned_flops is not None:
+        logger.info(f"Pruned FLOPs:    {r.pruned_flops:,}")
+    if r.flops_reduction is not None:
+        logger.info(f"FLOPs reduction: {r.flops_reduction:.2f}x")
     logger.info(f"Baseline:        {r.baseline}")
     if r.pruned_no_comp is not None:
         logger.info(f"Pruned (no comp): {r.pruned_no_comp}")
     logger.info(f"Pruned:          {r.pruned}")
     if r.output_dir is not None:
         logger.info(f"Output dir:      {r.output_dir}")
+
+
+def _append_results_log(
+    full_cfg: FullConfig,
+    task_cfg: TaskConfig,
+    meta: dict,
+    report: PruneReport,
+    overrides: Optional[List[str]],
+) -> None:
+    """Serialize the run to the results log JSON. Best-effort: any failure
+    here is logged but never raised — logging must not kill a long run."""
+    try:
+        path = full_cfg.runner.results_log
+        if path is None:
+            return
+
+        sig = results_log.signature_from_overrides(overrides)
+        if sig is None:
+            sig = results_log.signature_from_report({
+                "model_name": report.model_name,
+                "task": report.task,
+                "sparsity": full_cfg.pruning.sparsity,
+                "schedule": full_cfg.pruning.schedule.value,
+                "ranker": full_cfg.pruning.ranker.value,
+                "target": full_cfg.pruning.target.value,
+            })
+
+        effective_config = {
+            "model": task_cfg.model,
+            "task": task_cfg.task,
+            "dataset": {k: str(v) if isinstance(v, Path) else v
+                        for k, v in task_cfg.dataset.items()},
+            "pruning": {
+                "target": full_cfg.pruning.target.value,
+                "schedule": full_cfg.pruning.schedule.value,
+                "sparsity": full_cfg.pruning.sparsity,
+                "ranker": full_cfg.pruning.ranker.value,
+                "lambda_reg": full_cfg.pruning.lambda_reg,
+                "min_channels": full_cfg.pruning.min_channels,
+                "min_heads": full_cfg.pruning.min_heads,
+                "min_qk_dim": full_cfg.pruning.min_qk_dim,
+                "qk_sparsity": full_cfg.pruning.qk_sparsity,
+            },
+            "collector": {
+                "covariance_mode": full_cfg.collector.covariance_mode.value,
+                "subsample_tokens": full_cfg.collector.subsample_tokens,
+            },
+            "runner": {
+                "dtype": full_cfg.runner.dtype,
+                "seed": full_cfg.runner.seed,
+                "calib_samples": full_cfg.runner.calib_samples,
+            },
+            "sparsity_split": task_cfg.sparsity_split,
+            "overrides": overrides or [],
+            "source": (meta or {}).get("source"),
+        }
+
+        entry = results_log.build_entry(
+            report,
+            effective_config=effective_config,
+            orig_num_params=report.original_params,
+            orig_flops=report.original_flops,
+            pruned_num_params=report.pruned_params,
+            pruned_flops=report.pruned_flops,
+        )
+        results_log.append(Path(path), sig, entry)
+    except Exception as e:
+        logger.warning(f"Failed to append results log entry: {e}")
