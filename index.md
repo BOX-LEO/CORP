@@ -16,16 +16,15 @@ It removes channels and attention dimensions in a single pass.
 
 CORP treats pruning as a **representation recovery problem**.
 
-We approximate removed features with an affine model:
-$$
-x_P ≈ B x_S + c
-$$
+We approximate removed features with an affine model: $ x_P ≈ B x_S + c $
 Then fold compensation into weights:
-$$
-\widehat W_S = W_S + W_P B \\
-\widehat b = b + W_P c
-$$
+$\widehat W_S = W_S + W_P B $ $\widehat b = b + W_P c$
 This minimizes representation error without retraining.
+## Features
+
+| Mthd       | Scope         | structured | label-free | gradient-free | Hessian-free | finetuning-free |
+| ---------- | ------------- | ---------- | ---------- | ------------- | ------------ | --------------- |
+| CORP | MLP+Attention | ✅          | ✅          | ✅             | ✅            | ✅               |
 
 ## Method
 
@@ -72,11 +71,6 @@ This table shows Top-1 accuracy, FLOPs, and parameter count under 50% structured
 
 This table shows the trade-off between accuracy and efficiency as sparsity increases. Accuracy remains stable up to moderate sparsity, with only a small drop at 50% pruning (84.97 → 83.27). At the same time, parameters and FLOPs decrease steadily, reaching over 40% reduction at 50% sparsity. Throughput improves consistently and exceeds 2× at high sparsity. Latency does not decrease monotonically due to hardware and memory effects, but overall efficiency follows FLOPs reduction. These results show that CORP achieves strong practical speedup while preserving accuracy, especially at moderate sparsity levels.
 
-## Features
-
-| Mthd       | Scope         | structured | label-free | gradient-free | Hessian-free | finetuning-free |
-| ---------- | ------------- | ---------- | ---------- | ------------- | ------------ | --------------- |
-| CORP(Ours) | MLP+Attention | ✅          | ✅          | ✅             | ✅            | ✅               |
 
 ## Limitations
 
