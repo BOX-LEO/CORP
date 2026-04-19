@@ -1,8 +1,10 @@
-# CORP: Closed-Form One-shot Representation-Preserving Structured Pruning
+
 
 **One-shot structured pruning for Transformers. No labels. No gradients. No finetuning.**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2602.05243-red)](https://arxiv.org/abs/2602.05243)| [![GitHub](https://img.shields.io/badge/GitHub-Code-black)](https://github.com/BOX-LEO/CORP)
+[![arXiv](https://img.shields.io/badge/arXiv-2602.05243-red)](https://arxiv.org/abs/2602.05243)
+
+[![GitHub](https://img.shields.io/badge/GitHub-Code-black)](https://github.com/BOX-LEO/CORP)
 
 ## Overview
 
@@ -27,7 +29,7 @@ This minimizes representation error without retraining.
 
 ## Method
 
-![pruning_illustration](/Users/boxiangzhang/CORP/figs/pruning_illustration.png)
+![pruning_illustration](figs/pruning_illustration.png)
 
 **Step 1. Structured pruning**
 
