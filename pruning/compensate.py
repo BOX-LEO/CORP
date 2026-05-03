@@ -581,7 +581,6 @@ class QKDimCompensator:
                 head_idx=head_idx,
                 prune_indices=prune_indices,
                 survivor_indices=survivor_indices,
-                L=I,  # Backward compatibility
                 U=I,
                 V=I,
                 mu_q_S=torch.zeros(n_surv),

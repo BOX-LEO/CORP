@@ -1,11 +1,16 @@
 """OPT loader via HuggingFace transformers.
 
-Exposes a post-pruning hook (`prune_attention_heads`) used by orchestration
-when attention heads need to be physically removed from OPT's split
-q/k/v/out_proj layers (not fused like ViT).
+Exposes two post-pruning hooks used by orchestration:
+- `prune_attention_heads`: physically remove whole attention heads
+  from OPT's split q/k/v/out_proj layers (not fused like ViT).
+- `prune_attention_qk_dims`: dim-logit pruning — shrink per-head Q/K dim
+  while V and out_proj stay intact, with optional Sylvester-based
+  compensation folded into Q/K weights. Patches `self_attn.forward` since
+  HF OPT's upstream forward assumes Q/K/V share the same per-head dim.
 """
 
-from typing import Dict, Tuple, Optional
+import types
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,7 +45,14 @@ def load(
 
     model_id = f"facebook/opt-{name}"
     torch_dtype = getattr(torch, dtype)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+    # Force eager attention: the dim-logit patched forward in
+    # `prune_attention_qk_dims` is a manual eager implementation, so the
+    # unpruned baseline must also use eager to give an apples-to-apples
+    # comparison (sdpa and eager produce slightly different numerics that
+    # compound across layers).
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch_dtype, attn_implementation="eager",
+    )
     model.eval()
     if device:
         model = model.to(device)
@@ -109,3 +121,113 @@ def prune_attention_heads(self_attn: nn.Module, prune_head_indices: torch.Tensor
 
     self_attn.num_heads = n_survivors
     self_attn.embed_dim = n_survivors * head_dim
+
+
+def _make_opt_qk_dim_pruned_forward(self_attn: nn.Module):
+    """Patched forward for OPT attention with Q/K dim < V dim.
+
+    Mirrors HF `OPTAttention.forward` but reshapes Q/K with `_qk_dim` and V with
+    `head_dim`, runs manual eager attention (matmul + scale + mask + softmax +
+    matmul), and calls `past_key_values.update(...)` so KV-cache decoding still
+    works (cache stores K and V independently per layer, so dim mismatch is fine).
+    Returns `(attn_output, attn_weights)` to match the decoder layer's
+    `hidden_states, _ = self.self_attn(...)` unpacking.
+    """
+    num_heads = self_attn.num_heads
+    qk_dim = self_attn._qk_dim
+    v_dim = self_attn.head_dim
+
+    def forward(self, hidden_states, past_key_values=None, attention_mask=None,
+                output_attentions=False, **kwargs):
+        B, T, _ = hidden_states.shape
+        q = (self.q_proj(hidden_states) * self.scaling).view(B, T, num_heads, qk_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(B, T, num_heads, qk_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(B, T, num_heads, v_dim).transpose(1, 2)
+
+        if past_key_values is not None:
+            k, v = past_key_values.update(k, v, self.layer_idx)
+
+        attn_weights = q @ k.transpose(-2, -1)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
+        attn_weights = attn_weights.softmax(dim=-1, dtype=torch.float32).to(q.dtype)
+        out = (attn_weights @ v).transpose(1, 2).reshape(B, T, num_heads * v_dim)
+        out = self.out_proj(out)
+        return out, (attn_weights if output_attentions else None)
+
+    return types.MethodType(forward, self_attn)
+
+
+def prune_attention_qk_dims(
+    self_attn: nn.Module,
+    compensation_results: List,
+    qk_compensator=None,
+) -> None:
+    """Per-head Q/K dim pruning for OPT (dim-logit mode).
+
+    Shrinks `q_proj` and `k_proj` from `(num_heads * head_dim, embed_dim)` to
+    `(num_heads * n_surv, embed_dim)`. Optionally folds U/V Sylvester transforms
+    via `qk_compensator.fold_dim_logit_weights`. V and out_proj are untouched.
+    `num_heads`, `head_dim`, `embed_dim` are unchanged; only the per-head Q/K
+    dimension shrinks. Updates `scaling` to `n_surv ** -0.5` and patches
+    `self_attn.forward` to handle the asymmetric Q/K vs V dim.
+
+    Args:
+        self_attn: OPT attention module
+        compensation_results: list of QKDimCompensationResult, one per head
+        qk_compensator: QKDimCompensator instance (None to skip compensation)
+    """
+    if not compensation_results:
+        return
+
+    num_heads = self_attn.num_heads
+    head_dim = self_attn.head_dim
+    embed_dim = self_attn.embed_dim
+
+    n_surv = len(compensation_results[0].survivor_indices)
+    apply_comp = qk_compensator is not None
+
+    q_proj = self_attn.q_proj
+    k_proj = self_attn.k_proj
+    has_q_bias = q_proj.bias is not None
+    has_k_bias = k_proj.bias is not None
+    device = q_proj.weight.device
+    dtype = q_proj.weight.dtype
+
+    new_q = nn.Linear(embed_dim, num_heads * n_surv, bias=has_q_bias, device=device, dtype=dtype)
+    new_k = nn.Linear(embed_dim, num_heads * n_surv, bias=has_k_bias, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        for result in compensation_results:
+            h = result.head_idx
+            row_start = h * head_dim
+            row_end = row_start + head_dim
+
+            W_Q_h = q_proj.weight.data[row_start:row_end, :]
+            W_K_h = k_proj.weight.data[row_start:row_end, :]
+            b_Q_h = q_proj.bias.data[row_start:row_end] if has_q_bias else None
+            b_K_h = k_proj.bias.data[row_start:row_end] if has_k_bias else None
+
+            if apply_comp:
+                W_Q_new, b_Q_new, W_K_new, b_K_new = qk_compensator.fold_dim_logit_weights(
+                    result, W_Q_h, b_Q_h, W_K_h, b_K_h,
+                )
+            else:
+                surv = result.survivor_indices
+                W_Q_new = W_Q_h[surv]
+                W_K_new = W_K_h[surv]
+                b_Q_new = b_Q_h[surv] if b_Q_h is not None else None
+                b_K_new = b_K_h[surv] if b_K_h is not None else None
+
+            new_q.weight.data[h * n_surv:(h + 1) * n_surv] = W_Q_new.to(device=device, dtype=dtype)
+            new_k.weight.data[h * n_surv:(h + 1) * n_surv] = W_K_new.to(device=device, dtype=dtype)
+            if has_q_bias and b_Q_new is not None:
+                new_q.bias.data[h * n_surv:(h + 1) * n_surv] = b_Q_new.to(device=device, dtype=dtype)
+            if has_k_bias and b_K_new is not None:
+                new_k.bias.data[h * n_surv:(h + 1) * n_surv] = b_K_new.to(device=device, dtype=dtype)
+
+    self_attn.q_proj = new_q
+    self_attn.k_proj = new_k
+    self_attn._qk_dim = n_surv
+    self_attn.scaling = n_surv ** -0.5
+    self_attn.forward = _make_opt_qk_dim_pruned_forward(self_attn)

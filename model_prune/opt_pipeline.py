@@ -17,12 +17,15 @@ import torch.nn as nn
 
 from pruning.apply_masks import MaskApplier
 from pruning.collect import ActivationCollector, LayerActivationStats
-from pruning.compensate import AffineCompensator
-from pruning.ranking import RankingPolicy, StructureRanker
+from pruning.compensate import AffineCompensator, QKDimCompensator
+from pruning.ranking import QKDimRanker, RankingPolicy, StructureRanker
 from pruning.stats import RedundancyAnalyzer, RedundancyReport
 
-from config.schemas import FullConfig, PruneTarget, RankerType, ScheduleType
-from model.opt import prune_attention_heads as prune_opt_attention_heads
+from config.schemas import AttnMode, FullConfig, PruneTarget, RankerType, ScheduleType
+from model.opt import (
+    prune_attention_heads as prune_opt_attention_heads,
+    prune_attention_qk_dims as prune_opt_attention_qk_dims,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,53 @@ def _make_opt_attn_head_hook(collector: ActivationCollector, layer_name: str,
     return hook
 
 
+def _make_opt_qk_dim_hook(collector: ActivationCollector, layer_name: str,
+                          self_attn: nn.Module):
+    """Per-head per-dim Q/K activation hook for OPT dim-logit pruning.
+
+    Hooks the self_attn module forward, recomputes `q_proj(hidden_states)` and
+    `k_proj(hidden_states)` (cheap during calibration), and feeds the per-head
+    Q, K, and joint q²·k² stats into the collector under keys matching the
+    generic dim-logit path so `RedundancyAnalyzer.generate_all_qk_dim_reports`
+    works unchanged. Reports come back keyed `{layer_name}.attn.head_{h}`.
+
+    Note: must be registered with `with_kwargs=True` because OPTDecoderLayer
+    calls `self_attn(hidden_states=..., ...)` — all kwargs, no positional args.
+    """
+    num_heads = self_attn.num_heads
+    head_dim = self_attn.head_dim
+    q_proj = self_attn.q_proj
+    k_proj = self_attn.k_proj
+    subsample = collector.config.subsample_tokens
+
+    def hook(module, args, kwargs, output):
+        if not collector._collecting:
+            return
+        x = kwargs.get("hidden_states")
+        if x is None and args:
+            x = args[0]
+        if x is None:
+            return
+        x = x.detach()
+        with torch.no_grad():
+            q = q_proj(x).reshape(x.shape[0], x.shape[1], num_heads, head_dim)
+            k = k_proj(x).reshape(x.shape[0], x.shape[1], num_heads, head_dim)
+
+        if subsample is not None and q.shape[1] > subsample:
+            indices = torch.randperm(q.shape[1], device=q.device)[:subsample]
+            q = q[:, indices, :, :]
+            k = k[:, indices, :, :]
+
+        for h in range(num_heads):
+            q_h = q[:, :, h, :].reshape(-1, head_dim)
+            k_h = k[:, :, h, :].reshape(-1, head_dim)
+            collector._process_activation_raw(f"{layer_name}.q.head_{h}", q_h, is_head_stat=False)
+            collector._process_activation_raw(f"{layer_name}.k.head_{h}", k_h, is_head_stat=False)
+            q2k2 = (q_h ** 2) * (k_h ** 2)
+            collector._accumulate_q2k2(f"{layer_name}.qk.head_{h}", q2k2, head_dim)
+    return hook
+
+
 @dataclass
 class OPTRunResult:
     success: bool
@@ -63,8 +113,30 @@ class OPTRunResult:
     output_dir: Optional[Any] = None
 
 
+def _register_attn_hook(collector, layer, layer_idx: int, attn_mode: str) -> None:
+    """Register the right attention hook for `attn_mode`. Returns None."""
+    if attn_mode == "dim_logit":
+        # Hook self_attn itself so the hook can access hidden_states (kwargs)
+        # and recompute Q, K per-head. Report keys: {name}.attn.head_{h}.
+        # `with_kwargs=True` is required because OPTDecoderLayer calls
+        # self_attn(hidden_states=...) with everything as kwargs.
+        name = f"model.decoder.layers.{layer_idx}.self_attn"
+        hook = _make_opt_qk_dim_hook(collector, name, layer.self_attn)
+        collector._hooks.append(
+            layer.self_attn.register_forward_hook(hook, with_kwargs=True)
+        )
+    else:
+        # Head-pruning: hook out_proj input, store per-head L2 norms.
+        name = f"model.decoder.layers.{layer_idx}.self_attn.out_proj"
+        hook = _make_opt_attn_head_hook(
+            collector, name, layer.self_attn.num_heads, layer.self_attn.head_dim,
+        )
+        collector._hooks.append(layer.self_attn.out_proj.register_forward_hook(hook))
+
+
 def _collect_layer_stats(
     model, layer_idx, calib_loader, collector_cfg, device, target: str,
+    attn_mode: str = "head",
 ) -> Dict[str, LayerActivationStats]:
     layer = model.model.decoder.layers[layer_idx]
     collector = ActivationCollector(model, collector_cfg, device)
@@ -75,11 +147,7 @@ def _collect_layer_stats(
         collector._hooks.append(layer.fc2.register_forward_hook(hook))
 
     if target in ("attn", "both"):
-        name = f"model.decoder.layers.{layer_idx}.self_attn.out_proj"
-        hook = _make_opt_attn_head_hook(
-            collector, name, layer.self_attn.num_heads, layer.self_attn.head_dim,
-        )
-        collector._hooks.append(layer.self_attn.out_proj.register_forward_hook(hook))
+        _register_attn_hook(collector, layer, layer_idx, attn_mode)
 
     with collector.collect():
         for batch in calib_loader:
@@ -91,6 +159,7 @@ def _collect_layer_stats(
 
 def _collect_all_stats(
     model, calib_loader, collector_cfg, num_layers, device, target: str,
+    attn_mode: str = "head",
 ) -> Dict[str, LayerActivationStats]:
     collector = ActivationCollector(model, collector_cfg, device)
     for i in range(num_layers):
@@ -100,11 +169,7 @@ def _collect_all_stats(
             hook = collector._create_input_hook(name)
             collector._hooks.append(layer.fc2.register_forward_hook(hook))
         if target in ("attn", "both"):
-            name = f"model.decoder.layers.{i}.self_attn.out_proj"
-            hook = _make_opt_attn_head_hook(
-                collector, name, layer.self_attn.num_heads, layer.self_attn.head_dim,
-            )
-            collector._hooks.append(layer.self_attn.out_proj.register_forward_hook(hook))
+            _register_attn_hook(collector, layer, i, attn_mode)
     with collector.collect():
         for batch in calib_loader:
             with torch.no_grad():
@@ -130,7 +195,8 @@ def _apply_mlp(model, layer_idx, stats, report, ranker, compensator, mask_applie
     return {"layer": layer_idx, "type": "mlp", "pruned": n_prune, "total": n_total}
 
 
-def _apply_attn(model, layer_idx, report, ranker, sparsity, num_heads, min_heads) -> dict:
+def _apply_attn_head(model, layer_idx, report, ranker, sparsity, num_heads, min_heads) -> dict:
+    """Whole-head pruning (existing path)."""
     layer = model.model.decoder.layers[layer_idx]
     target_prune = max(0, int(num_heads * sparsity))
     target_prune = min(target_prune, num_heads - min_heads)
@@ -154,6 +220,44 @@ def _apply_attn(model, layer_idx, report, ranker, sparsity, num_heads, min_heads
     return {"layer": layer_idx, "type": "attn", "pruned": len(prune_idx), "total": num_heads}
 
 
+def _apply_attn_qk_dim(
+    model, layer_idx, qk_reports, qk_ranker, qk_compensator,
+    qk_sparsity, skip_compensation,
+) -> dict:
+    """Per-head Q/K dim-logit pruning. Mirrors generic ViT path."""
+    layer = model.model.decoder.layers[layer_idx]
+    self_attn = layer.self_attn
+    num_heads = self_attn.num_heads
+    head_dim = self_attn.head_dim
+    layer_name = f"model.decoder.layers.{layer_idx}.self_attn"
+
+    compensation_results = []
+    total_pruned = 0
+    for h in range(num_heads):
+        key = f"{layer_name}.attn.head_{h}"
+        if key not in qk_reports:
+            logger.warning(f"Missing Q/K report for {key}, skipping head")
+            continue
+        report = qk_reports[key]
+        prune_idx, surv_idx = qk_ranker.select_for_sparsity(report, qk_sparsity)
+        result = qk_compensator.fit_dim_logit(
+            report.q_stats, report.k_stats, prune_idx, surv_idx, layer_name, h,
+        )
+        compensation_results.append(result)
+        total_pruned += len(prune_idx)
+
+    if compensation_results:
+        prune_opt_attention_qk_dims(
+            self_attn, compensation_results,
+            qk_compensator=None if skip_compensation else qk_compensator,
+        )
+
+    return {
+        "layer": layer_idx, "type": "attn_qk_dim",
+        "pruned": total_pruned, "total": num_heads * head_dim,
+    }
+
+
 def run_opt_prune(
     model: nn.Module,
     calib_loader,
@@ -168,6 +272,7 @@ def run_opt_prune(
     prune_mlp = target_value in ("mlp", "both")
     prune_attn = target_value in ("attn", "both")
     schedule = full_cfg.pruning.schedule.value
+    attn_mode = full_cfg.pruning.attn_mode.value
     device = full_cfg.runner.device
 
     original_params = sum(p.numel() for p in model.parameters())
@@ -185,6 +290,11 @@ def run_opt_prune(
         lambda_reg=full_cfg.pruning.lambda_reg,
         auto_shrinkage=full_cfg.pruning.auto_shrinkage,
     )
+    qk_ranker = QKDimRanker(min_qk_dim=full_cfg.pruning.min_qk_dim)
+    qk_compensator = QKDimCompensator(
+        lambda_reg=full_cfg.pruning.lambda_reg,
+        auto_shrinkage=full_cfg.pruning.auto_shrinkage,
+    )
     mask_applier = MaskApplier(validate_shapes=True)
 
     from config.schemas import CollectorConfig, CovarianceMode
@@ -197,14 +307,35 @@ def run_opt_prune(
 
     mlp_s = mlp_sparsity if mlp_sparsity is not None else full_cfg.pruning.sparsity
     attn_s = attn_sparsity if attn_sparsity is not None else full_cfg.pruning.sparsity
+    qk_s = full_cfg.pruning.qk_sparsity
     results: List[dict] = []
+
+    def _do_attn(stats_dict, reports_dict, qk_reports, layer_idx):
+        if attn_mode == "dim_logit":
+            results.append(_apply_attn_qk_dim(
+                pruned_model, layer_idx, qk_reports, qk_ranker, qk_compensator,
+                qk_s, skip_compensation,
+            ))
+        else:
+            key = f"model.decoder.layers.{layer_idx}.self_attn.out_proj"
+            if key in stats_dict:
+                heads = pruned_model.model.decoder.layers[layer_idx].self_attn.num_heads
+                results.append(_apply_attn_head(
+                    pruned_model, layer_idx, reports_dict[key], ranker, attn_s, heads,
+                    full_cfg.pruning.min_heads,
+                ))
 
     try:
         if schedule == "global":
             all_stats = _collect_all_stats(
                 pruned_model, calib_loader, collector_cfg, num_layers, device, target_value,
+                attn_mode=attn_mode,
             )
             all_reports = analyzer.reports_from_all_stats(all_stats)
+            qk_reports = (
+                analyzer.generate_all_qk_dim_reports(all_stats)
+                if prune_attn and attn_mode == "dim_logit" else {}
+            )
             for i in range(num_layers):
                 if prune_mlp:
                     key = f"model.decoder.layers.{i}.fc2"
@@ -214,19 +345,18 @@ def run_opt_prune(
                             ranker, compensator, mask_applier, mlp_s, skip_compensation,
                         ))
                 if prune_attn:
-                    key = f"model.decoder.layers.{i}.self_attn.out_proj"
-                    if key in all_stats:
-                        heads = pruned_model.model.decoder.layers[i].self_attn.num_heads
-                        results.append(_apply_attn(
-                            pruned_model, i, all_reports[key], ranker, attn_s, heads,
-                            full_cfg.pruning.min_heads,
-                        ))
+                    _do_attn(all_stats, all_reports, qk_reports, i)
         else:  # layerwise
             for i in range(num_layers):
                 stats = _collect_layer_stats(
                     pruned_model, i, calib_loader, collector_cfg, device, target_value,
+                    attn_mode=attn_mode,
                 )
                 reports = analyzer.reports_from_all_stats(stats)
+                qk_reports = (
+                    analyzer.generate_all_qk_dim_reports(stats)
+                    if prune_attn and attn_mode == "dim_logit" else {}
+                )
                 if prune_mlp:
                     key = f"model.decoder.layers.{i}.fc2"
                     if key in stats:
@@ -235,14 +365,8 @@ def run_opt_prune(
                             ranker, compensator, mask_applier, mlp_s, skip_compensation,
                         ))
                 if prune_attn:
-                    key = f"model.decoder.layers.{i}.self_attn.out_proj"
-                    if key in stats:
-                        heads = pruned_model.model.decoder.layers[i].self_attn.num_heads
-                        results.append(_apply_attn(
-                            pruned_model, i, reports[key], ranker, attn_s, heads,
-                            full_cfg.pruning.min_heads,
-                        ))
-                del stats, reports
+                    _do_attn(stats, reports, qk_reports, i)
+                del stats, reports, qk_reports
                 torch.cuda.empty_cache()
 
         pruned_params = sum(p.numel() for p in pruned_model.parameters())

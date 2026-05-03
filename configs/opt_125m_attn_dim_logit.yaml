@@ -1,0 +1,45 @@
+# Prune OPT-125m attention via per-head Q/K dim-logit (Sylvester-based
+# logit-matching compensation). Calibrate on C4, evaluate perplexity on
+# WikiText-2. Mirrors the generic ViT dim-logit path; requires
+# covariance_mode: exact. Set pruning.attn_mode=head to fall back to the
+# legacy whole-head pruner.
+
+model:
+  source: hf_opt
+  name: "125m"
+  pretrained: true
+
+task: language_modeling
+
+dataset:
+  n_calib_segments: 128
+  seq_len: 2048
+  batch_size: 4
+  seed: 42
+
+cache:
+  baseline_dir: cache/baselines
+  stats_dir: cache/stats
+
+pruning:
+  target: attn
+  schedule: global
+  attn_mode: dim_logit
+  sparsity: 0.3            # ignored for attn dim-logit; qk_sparsity controls it
+  qk_sparsity: 0.3
+  min_qk_dim: 8
+  ranker: active_energy    # only used by MLP path; attn dim-logit uses Q/K joint energy
+  lambda_reg: 1.0e-3
+  min_channels: 64
+  min_heads: 1
+
+collector:
+  covariance_mode: exact
+  store_raw: false
+
+runner:
+  device: cuda
+  dtype: float32
+  seed: 42
+  output_dir: logs
+  calib_samples: 128

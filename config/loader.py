@@ -16,6 +16,7 @@ from typing import Any, Optional
 import yaml
 
 from .schemas import (
+    AttnMode,
     CollectorConfig,
     CovarianceMode,
     FullConfig,
@@ -159,6 +160,7 @@ def load_yaml_config(
         min_qk_dim=int(p.get("min_qk_dim", 8)),
         qk_sparsity=float(p.get("qk_sparsity", 0.3)),
         keep_topk_outliers=int(p.get("keep_topk_outliers", 0)),
+        attn_mode=_enum(p.get("attn_mode", "dim_logit"), AttnMode),
     )
 
     # --- runner ---

@@ -37,6 +37,11 @@ class CovarianceMode(Enum):
     SKETCH = "sketch"
 
 
+class AttnMode(Enum):
+    HEAD = "head"
+    DIM_LOGIT = "dim_logit"
+
+
 @dataclass
 class CollectorConfig:
     target: PruneTarget = PruneTarget.MLP
@@ -61,6 +66,7 @@ class PruningConfig:
     min_qk_dim: int = 8
     qk_sparsity: float = 0.3
     keep_topk_outliers: int = 0
+    attn_mode: AttnMode = AttnMode.DIM_LOGIT
 
 
 @dataclass
