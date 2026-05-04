@@ -13,6 +13,7 @@ Pipeline:
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -123,9 +124,11 @@ def _run_generic(
 
 def _run_opt(
     full_cfg: FullConfig,
+    task_cfg: TaskConfig,
     model,
     calib_loader,
     meta: dict,
+    model_name: str,
     skip_compensation: bool = False,
     mlp_sparsity: Optional[float] = None,
     attn_sparsity: Optional[float] = None,
@@ -139,6 +142,9 @@ def _run_opt(
         skip_compensation=skip_compensation,
         mlp_sparsity=mlp_sparsity,
         attn_sparsity=attn_sparsity,
+        model_name=model_name,
+        stats_cache_dir=task_cfg.cache.get("stats_dir"),
+        force_recollect=bool(task_cfg.cache.get("force_recollect", False)),
     )
 
 
@@ -162,7 +168,7 @@ def _apply_sparsity_split(
 
     if meta.get("source") == "hf_opt":
         return _run_opt(
-            full_cfg, model, calib_loader, meta,
+            full_cfg, task_cfg, model, calib_loader, meta, model_name,
             skip_compensation=skip_compensation,
             mlp_sparsity=mlp_s, attn_sparsity=attn_s,
         )
@@ -273,7 +279,12 @@ def run_prune(
             skip_compensation=False,
         )
     elif meta.get("source") == "hf_opt":
-        result = _run_opt(full_cfg, model, loaders["calib"], meta, skip_compensation=False)
+        result = _run_opt(full_cfg, task_cfg, model, loaders["calib"], meta, name, skip_compensation=False)
+        # OPT doesn't take the eval_no_comp ablation branch (gated below), so
+        # the parked CPU copy of the original is dead weight (~5 GB fp32 for
+        # 1.3B). Drop it now to keep RSS low for downstream eval / next sweep cell.
+        del model
+        gc.collect()
     else:
         result = _run_generic(full_cfg, task_cfg, model, loaders["calib"], name, skip_compensation=False)
 

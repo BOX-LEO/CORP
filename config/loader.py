@@ -161,6 +161,7 @@ def load_yaml_config(
         qk_sparsity=float(p.get("qk_sparsity", 0.3)),
         keep_topk_outliers=int(p.get("keep_topk_outliers", 0)),
         attn_mode=_enum(p.get("attn_mode", "dim_logit"), AttnMode),
+        qk_keep_original_scale=bool(p.get("qk_keep_original_scale", False)),
     )
 
     # --- runner ---

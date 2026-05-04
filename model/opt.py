@@ -162,6 +162,7 @@ def prune_attention_qk_dims(
     self_attn: nn.Module,
     compensation_results: List,
     qk_compensator=None,
+    keep_original_scale: bool = False,
 ) -> None:
     """Per-head Q/K dim pruning for OPT (dim-logit mode).
 
@@ -169,13 +170,19 @@ def prune_attention_qk_dims(
     `(num_heads * n_surv, embed_dim)`. Optionally folds U/V Sylvester transforms
     via `qk_compensator.fold_dim_logit_weights`. V and out_proj are untouched.
     `num_heads`, `head_dim`, `embed_dim` are unchanged; only the per-head Q/K
-    dimension shrinks. Updates `scaling` to `n_surv ** -0.5` and patches
-    `self_attn.forward` to handle the asymmetric Q/K vs V dim.
+    dimension shrinks. Updates `scaling` to `n_surv ** -0.5` (or `head_dim ** -0.5`
+    when `keep_original_scale=True`) and patches `self_attn.forward` to handle
+    the asymmetric Q/K vs V dim.
 
     Args:
         self_attn: OPT attention module
         compensation_results: list of QKDimCompensationResult, one per head
         qk_compensator: QKDimCompensator instance (None to skip compensation)
+        keep_original_scale: if True, keep the original `1/sqrt(head_dim)`
+            softmax scale instead of switching to `1/sqrt(n_surv)`. Useful for
+            dim-logit pruning where the surviving dims carry most of the
+            dot-product magnitude, so the textbook variance argument doesn't
+            apply and the rescale just sharpens softmax vs baseline.
     """
     if not compensation_results:
         return
@@ -229,5 +236,5 @@ def prune_attention_qk_dims(
     self_attn.q_proj = new_q
     self_attn.k_proj = new_k
     self_attn._qk_dim = n_surv
-    self_attn.scaling = n_surv ** -0.5
+    self_attn.scaling = (head_dim ** -0.5) if keep_original_scale else (n_surv ** -0.5)
     self_attn.forward = _make_opt_qk_dim_pruned_forward(self_attn)

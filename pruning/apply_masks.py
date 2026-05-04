@@ -18,7 +18,10 @@ from .collect import detect_mlp_type
 logger = logging.getLogger(__name__)
 
 
-def _make_qk_dim_pruned_attention_forward(attn, qk_dim: int, v_dim: int, num_heads: int):
+def _make_qk_dim_pruned_attention_forward(
+    attn, qk_dim: int, v_dim: int, num_heads: int,
+    keep_original_scale: bool = False,
+):
     """Create a patched forward method for Q/K dimension pruned attention.
 
     For dim-logit pruning, Q/K have reduced dimensions while V keeps full dimensions.
@@ -29,6 +32,11 @@ def _make_qk_dim_pruned_attention_forward(attn, qk_dim: int, v_dim: int, num_hea
         qk_dim: Dimension per head for Q/K (reduced)
         v_dim: Dimension per head for V (original head_dim)
         num_heads: Number of attention heads
+        keep_original_scale: if True, use `1/sqrt(v_dim)` (the original head_dim)
+            for softmax scaling instead of `1/sqrt(qk_dim)`. Use this when the
+            surviving Q/K dims carry most of the dot-product magnitude (typical
+            for dim-logit pruning), so the textbook variance argument doesn't
+            apply and rescaling would just sharpen softmax vs baseline.
     """
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         B, N, C = x.shape
@@ -55,8 +63,11 @@ def _make_qk_dim_pruned_attention_forward(attn, qk_dim: int, v_dim: int, num_hea
         if hasattr(self, 'k_norm') and self.k_norm is not None:
             k = self.k_norm(k)
 
-        # Attention with scale based on reduced Q/K dimension
-        scale = qk_dim ** -0.5
+        # Attention scale: by default, switch to `1/sqrt(qk_dim)` (textbook
+        # scaling for the new key dim); with `keep_original_scale=True`, keep
+        # `1/sqrt(v_dim)` (the original head_dim) so the softmax distribution
+        # stays close to baseline under dim-logit pruning.
+        scale = (v_dim ** -0.5) if keep_original_scale else (qk_dim ** -0.5)
 
         if hasattr(self, 'fused_attn') and self.fused_attn:
             # Note: scaled_dot_product_attention expects same dim for Q/K/V
@@ -412,6 +423,7 @@ class MaskApplier:
         attn: nn.Module,
         compensation_results: List[QKDimCompensationResult],
         qk_compensator: Optional[QKDimCompensator] = None,
+        keep_original_scale: bool = False,
     ) -> nn.Module:
         """Prune Q/K dimensions from attention layer using dim-logit mode.
 
@@ -419,6 +431,8 @@ class MaskApplier:
             attn: Attention module with qkv and proj attributes
             compensation_results: List of compensation results, one per head
             qk_compensator: QKDimCompensator instance for folding weights (None to skip compensation)
+            keep_original_scale: if True, keep `1/sqrt(original_head_dim)` softmax
+                scaling instead of switching to `1/sqrt(n_surv)`.
 
         Returns:
             Modified attention module
@@ -553,11 +567,14 @@ class MaskApplier:
 
         # Update attention parameters for reduced Q/K dims
         attn.head_dim = n_surv  # New reduced head_dim for Q/K
-        attn.scale = n_surv ** -0.5  # Update scale for new Q/K dim
+        # Scale: by default use new Q/K dim; with `keep_original_scale=True`,
+        # retain the original head_dim scaling so softmax stays close to baseline.
+        attn.scale = (v_dim_per_head ** -0.5) if keep_original_scale else (n_surv ** -0.5)
 
         # Patch forward to handle different Q/K vs V dimensions
         attn.forward = _make_qk_dim_pruned_attention_forward(
-            attn, n_surv, v_dim_per_head, num_heads
+            attn, n_surv, v_dim_per_head, num_heads,
+            keep_original_scale=keep_original_scale,
         )
 
         return attn

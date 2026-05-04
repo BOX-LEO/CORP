@@ -10,12 +10,14 @@ on ``meta['source'] == 'hf_opt'``.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import copy
+import gc
 import logging
 
 import torch
 import torch.nn as nn
 
 from pruning.apply_masks import MaskApplier
+from pruning.cache import compute_cache_key, load_stats_cache, save_stats_cache
 from pruning.collect import ActivationCollector, LayerActivationStats
 from pruning.compensate import AffineCompensator, QKDimCompensator
 from pruning.ranking import QKDimRanker, RankingPolicy, StructureRanker
@@ -222,7 +224,7 @@ def _apply_attn_head(model, layer_idx, report, ranker, sparsity, num_heads, min_
 
 def _apply_attn_qk_dim(
     model, layer_idx, qk_reports, qk_ranker, qk_compensator,
-    qk_sparsity, skip_compensation,
+    qk_sparsity, skip_compensation, keep_original_scale=False,
 ) -> dict:
     """Per-head Q/K dim-logit pruning. Mirrors generic ViT path."""
     layer = model.model.decoder.layers[layer_idx]
@@ -250,6 +252,7 @@ def _apply_attn_qk_dim(
         prune_opt_attention_qk_dims(
             self_attn, compensation_results,
             qk_compensator=None if skip_compensation else qk_compensator,
+            keep_original_scale=keep_original_scale,
         )
 
     return {
@@ -266,19 +269,37 @@ def run_opt_prune(
     skip_compensation: bool = False,
     mlp_sparsity: Optional[float] = None,
     attn_sparsity: Optional[float] = None,
+    model_name: Optional[str] = None,
+    stats_cache_dir: Optional[Any] = None,
+    force_recollect: bool = False,
 ) -> OPTRunResult:
-    """OPT-specific pruning loop. Returns an OPTRunResult with a pruned_model."""
+    """OPT-specific pruning loop. Returns an OPTRunResult with a pruned_model.
+
+    When `stats_cache_dir` is set and `attn_mode == dim_logit`, activation
+    stats for the union of MLP fc2 + per-head Q/K dims are collected once and
+    cached on disk; subsequent runs with different ranker/sparsity/target
+    settings reuse the cache. The cache is target-agnostic (always collects
+    `target=both`-shaped stats), and keyed only on (model_name, calib_samples,
+    subsample_tokens), so the same stats serve every cell of a sweep.
+    """
     target_value = full_cfg.pruning.target.value
     prune_mlp = target_value in ("mlp", "both")
     prune_attn = target_value in ("attn", "both")
     schedule = full_cfg.pruning.schedule.value
     attn_mode = full_cfg.pruning.attn_mode.value
+    keep_original_scale = full_cfg.pruning.qk_keep_original_scale
     device = full_cfg.runner.device
 
     original_params = sum(p.numel() for p in model.parameters())
-    pruned_model = copy.deepcopy(model).to(device)
+    # Move original to CPU before deepcopy so we don't briefly hold 2x the
+    # model on GPU (a 1.3B fp32 spike of ~10 GB during deepcopy).
     model.cpu()
     torch.cuda.empty_cache()
+    pruned_model = copy.deepcopy(model).to(device)
+    # Drop our local reference; caller in model_prune/runner.py also drops
+    # its ref on the OPT path so the parked CPU copy can be reclaimed.
+    del model
+    gc.collect()
 
     analyzer = RedundancyAnalyzer()
     ranker = StructureRanker.from_config(
@@ -307,14 +328,21 @@ def run_opt_prune(
 
     mlp_s = mlp_sparsity if mlp_sparsity is not None else full_cfg.pruning.sparsity
     attn_s = attn_sparsity if attn_sparsity is not None else full_cfg.pruning.sparsity
-    qk_s = full_cfg.pruning.qk_sparsity
+    # Tie qk_sparsity to overall sparsity for sweep ergonomics — a single
+    # `pruning.sparsity` axis controls MLP intermediate channels and Q/K dims
+    # at the same fraction. Set `pruning.qk_sparsity` differently in YAML if
+    # you need an asymmetric split.
+    qk_s = (
+        attn_sparsity if attn_sparsity is not None
+        else full_cfg.pruning.sparsity
+    )
     results: List[dict] = []
 
     def _do_attn(stats_dict, reports_dict, qk_reports, layer_idx):
         if attn_mode == "dim_logit":
             results.append(_apply_attn_qk_dim(
                 pruned_model, layer_idx, qk_reports, qk_ranker, qk_compensator,
-                qk_s, skip_compensation,
+                qk_s, skip_compensation, keep_original_scale=keep_original_scale,
             ))
         else:
             key = f"model.decoder.layers.{layer_idx}.self_attn.out_proj"
@@ -325,17 +353,89 @@ def run_opt_prune(
                     full_cfg.pruning.min_heads,
                 ))
 
+    def _free_layer_stats(layer_idx, num_heads, stats_dict, reports_dict, qk_reports_dict):
+        """Drop stats/reports for one layer once its pruning step is done.
+
+        For OPT-1.3B each fc2 covariance is ~256 MB on CPU (fp32, 8192²);
+        without this the global-schedule path holds all 24 in RAM until the
+        sweep cell ends. QKDimReport holds refs to the same LayerActivationStats
+        in stats_dict, so we pop both to actually release.
+        """
+        fc2_key = f"model.decoder.layers.{layer_idx}.fc2"
+        stats_dict.pop(fc2_key, None)
+        reports_dict.pop(fc2_key, None)
+
+        layer_name = f"model.decoder.layers.{layer_idx}.self_attn"
+        if attn_mode == "dim_logit":
+            for h in range(num_heads):
+                qk_reports_dict.pop(f"{layer_name}.attn.head_{h}", None)
+                for prefix in ("q", "k", "qk"):
+                    sub = f"{layer_name}.{prefix}.head_{h}"
+                    stats_dict.pop(sub, None)
+                    reports_dict.pop(sub, None)
+        else:
+            out_key = f"{layer_name}.out_proj"
+            stats_dict.pop(out_key, None)
+            reports_dict.pop(out_key, None)
+
+    # Stats caching: only the dim-logit collection path is cached. Cache key
+    # is independent of target/ranker/sparsity, so all sweep cells share one
+    # cache entry. Always collects target="both"-shaped stats so the cache is
+    # target-agnostic (mirrors the pruning/runner.py:175-179 trick).
+    cache_hit = False
+    cache_key = None
+    if (
+        schedule == "global"
+        and attn_mode == "dim_logit"
+        and stats_cache_dir is not None
+        and model_name is not None
+    ):
+        cache_key = compute_cache_key(
+            model_name=f"{model_name}|opt_dim_logit",
+            calib_samples=full_cfg.runner.calib_samples,
+            subsample_tokens=full_cfg.collector.subsample_tokens,
+        )
+        if not force_recollect:
+            cached = load_stats_cache(stats_cache_dir, cache_key)
+            if cached is not None:
+                all_stats, qk_reports = cached
+                all_reports = analyzer.reports_from_all_stats(all_stats)
+                cache_hit = True
+                logger.info("Using cached OPT activation stats (skipping forward passes)")
+
     try:
         if schedule == "global":
-            all_stats = _collect_all_stats(
-                pruned_model, calib_loader, collector_cfg, num_layers, device, target_value,
-                attn_mode=attn_mode,
-            )
-            all_reports = analyzer.reports_from_all_stats(all_stats)
-            qk_reports = (
-                analyzer.generate_all_qk_dim_reports(all_stats)
-                if prune_attn and attn_mode == "dim_logit" else {}
-            )
+            if not cache_hit:
+                # Always collect both MLP + dim-logit attn stats so the cache is
+                # target-agnostic. Only override when caching is active; else
+                # honor the user's target to avoid wasted compute.
+                collect_target = "both" if (stats_cache_dir is not None and attn_mode == "dim_logit") else target_value
+                all_stats = _collect_all_stats(
+                    pruned_model, calib_loader, collector_cfg, num_layers, device,
+                    collect_target, attn_mode=attn_mode,
+                )
+                all_reports = analyzer.reports_from_all_stats(all_stats)
+                qk_reports = (
+                    analyzer.generate_all_qk_dim_reports(all_stats)
+                    if attn_mode == "dim_logit" else {}
+                )
+                if stats_cache_dir is not None and cache_key is not None and attn_mode == "dim_logit":
+                    save_stats_cache(
+                        stats_cache_dir, cache_key, all_stats, qk_reports,
+                        metadata={
+                            "model_name": model_name,
+                            "calib_samples": full_cfg.runner.calib_samples,
+                            "subsample_tokens": full_cfg.collector.subsample_tokens,
+                            "attn_mode": "dim_logit",
+                        },
+                    )
+            # Snapshot per-layer head counts before pruning. Needed for stats
+            # cleanup keys; head-mode pruning shrinks num_heads in place, so
+            # reading it after the fact would miss some keys.
+            heads_per_layer = [
+                pruned_model.model.decoder.layers[i].self_attn.num_heads
+                for i in range(num_layers)
+            ]
             for i in range(num_layers):
                 if prune_mlp:
                     key = f"model.decoder.layers.{i}.fc2"
@@ -346,6 +446,7 @@ def run_opt_prune(
                         ))
                 if prune_attn:
                     _do_attn(all_stats, all_reports, qk_reports, i)
+                _free_layer_stats(i, heads_per_layer[i], all_stats, all_reports, qk_reports)
         else:  # layerwise
             for i in range(num_layers):
                 stats = _collect_layer_stats(

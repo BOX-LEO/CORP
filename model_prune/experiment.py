@@ -9,8 +9,11 @@ Example ``experiment:`` block in a YAML config::
       result_cache: cache/experiments/deit_sweep.json
 
 The sweep is the cartesian product of listed values, applied as CLI-style
-overrides on top of the base YAML. Each run's summary is cached by the
-canonical override signature so re-running only executes missing cells.
+overrides on top of the base YAML. Each cell runs in a **fresh subprocess**
+so that activation-stats caches, model weights, and allocator fragmentation
+from one cell can't bleed into the next — critical for OPT-1.3B sweeps on
+machines that can't fit two cells' worth of state at once. The parent
+process only does scheduling and result aggregation.
 """
 
 from __future__ import annotations
@@ -18,13 +21,13 @@ from __future__ import annotations
 import itertools
 import json
 import logging
-from dataclasses import asdict
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-
-from .runner import run_prune, PruneReport
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +35,10 @@ logger = logging.getLogger(__name__)
 def _format_value(v) -> str:
     """Serialize a sweep value back into something the override parser can re-read.
 
-    yaml.safe_dump adds doc-end markers on scalars; `json.dumps` gives us clean
-    scalars and still round-trips through yaml.safe_load in the override parser.
+    json.dumps gives clean scalars that round-trip through yaml.safe_load in
+    the override parser.
     """
-    import json as _json
-    return _json.dumps(v)
+    return json.dumps(v)
 
 
 def _expand_sweep(sweep: Dict[str, list]) -> List[List[str]]:
@@ -67,12 +69,53 @@ def _run_signature(overrides: List[str]) -> str:
     return "|".join(sorted(overrides))
 
 
-def _serialize_report(r: PruneReport) -> dict:
-    d = asdict(r)
-    d["output_dir"] = str(d["output_dir"]) if d.get("output_dir") is not None else None
-    # step_results may contain non-serializable dataclasses — coerce to str.
-    d["step_results"] = [str(s) for s in d.get("step_results", [])]
-    return d
+def _run_cell_subprocess(
+    config_path: Path,
+    overrides: List[str],
+) -> Dict[str, Any]:
+    """Spawn `run_prune.py` as a subprocess for one sweep cell.
+
+    Returns the serialized PruneReport (parsed from the JSON the child writes
+    to a temp file). On non-zero exit or missing report, returns an error dict
+    in the same shape used by the in-process error path.
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    runner_script = project_root / "run_prune.py"
+
+    # Use NamedTemporaryFile only to reserve a unique path; the child writes
+    # to it. delete=False because the child opens it by name, not by fd.
+    with tempfile.NamedTemporaryFile(
+        prefix="prune_report_", suffix=".json", delete=False,
+    ) as tf:
+        report_path = Path(tf.name)
+
+    cmd: List[str] = [sys.executable, str(runner_script),
+                      "--config", str(config_path),
+                      "--report-out", str(report_path)]
+    for ov in overrides:
+        cmd.extend(["--set", ov])
+
+    try:
+        # Inherit stdout/stderr so the child's logging streams to the user's
+        # terminal in real time. No timeout — pruning + eval can take a while.
+        result = subprocess.run(cmd, cwd=str(project_root), check=False)
+        if result.returncode != 0:
+            return {
+                "error": f"subprocess exited with code {result.returncode}",
+                "overrides": overrides,
+            }
+        if not report_path.exists() or report_path.stat().st_size == 0:
+            return {
+                "error": "subprocess completed but wrote no report",
+                "overrides": overrides,
+            }
+        with open(report_path) as f:
+            return json.load(f)
+    finally:
+        try:
+            report_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def run_experiments(
@@ -81,7 +124,7 @@ def run_experiments(
     force: bool = False,
 ) -> Dict[str, dict]:
     """Run a YAML-defined sweep. Returns ``{signature: serialized_report}``."""
-    config_path = Path(config_path)
+    config_path = Path(config_path).resolve()
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
 
@@ -106,10 +149,9 @@ def run_experiments(
             continue
         logger.info(f"[run]    {sig}")
         try:
-            report = run_prune(config_path, overrides=full_overrides)
-            cache[sig] = _serialize_report(report)
+            cache[sig] = _run_cell_subprocess(config_path, full_overrides)
         except Exception as e:
-            logger.exception(f"Run failed for {sig}: {e}")
+            logger.exception(f"Failed to spawn cell for {sig}: {e}")
             cache[sig] = {"error": str(e), "overrides": full_overrides}
         _save_cache(result_cache_path, cache)
 

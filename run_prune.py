@@ -9,10 +9,13 @@ Usage::
 """
 
 import argparse
+import json
 import logging
 import sys
+from dataclasses import asdict
+from pathlib import Path
 
-from model_prune.runner import run_prune
+from model_prune.runner import PruneReport, run_prune
 
 
 def _parse():
@@ -26,8 +29,21 @@ def _parse():
         "--eval-no-comp", action="store_true",
         help="Additionally run and evaluate with compensation disabled (slow).",
     )
+    p.add_argument(
+        "--report-out", default=None,
+        help="If set, write the serialized PruneReport as JSON to this path. "
+             "Used by run_experiments.py for subprocess-per-cell sweeps.",
+    )
     p.add_argument("--log-level", default="INFO", help="Python logging level")
     return p.parse_args()
+
+
+def serialize_report(r: PruneReport) -> dict:
+    """Coerce a PruneReport into a JSON-safe dict."""
+    d = asdict(r)
+    d["output_dir"] = str(d["output_dir"]) if d.get("output_dir") is not None else None
+    d["step_results"] = [str(s) for s in d.get("step_results", [])]
+    return d
 
 
 def main() -> int:
@@ -37,6 +53,11 @@ def main() -> int:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     report = run_prune(args.config, overrides=args.overrides, eval_no_comp=args.eval_no_comp)
+    if args.report_out:
+        out = Path(args.report_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(serialize_report(report), f, indent=2, default=str)
     return 0 if report.success else 1
 
 

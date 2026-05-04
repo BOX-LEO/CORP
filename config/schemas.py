@@ -67,6 +67,7 @@ class PruningConfig:
     qk_sparsity: float = 0.3
     keep_topk_outliers: int = 0
     attn_mode: AttnMode = AttnMode.DIM_LOGIT
+    qk_keep_original_scale: bool = False
 
 
 @dataclass

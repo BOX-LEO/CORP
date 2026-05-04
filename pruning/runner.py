@@ -631,7 +631,8 @@ class PruneRunner:
         if compensation_results:
             self.mask_applier.prune_attention_qk_dims(
                 attn, compensation_results,
-                qk_compensator=None if skip_compensation else self.qk_compensator
+                qk_compensator=None if skip_compensation else self.qk_compensator,
+                keep_original_scale=self.pruning_config.qk_keep_original_scale,
             )
 
             logger.info(
