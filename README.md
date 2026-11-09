@@ -1,5 +1,7 @@
 # CORP — Activation-based structured pruning for transformers
 
+🎉 This paper has been accepted at NeurIPS 2026!
+
 One-shot structured pruning with closed-form compensation. A single generic
 pipeline (`pruning/`) drives four model families (DeiT/ViT, DINOv2, OPT) via
 a task-registry architecture and YAML configs.
@@ -118,7 +120,7 @@ Paths in the YAML resolve relative to the YAML file's directory.
 ## Citation
 ```
 @misc{zhang2026corpclosedformoneshotrepresentationpreserving,
-      title={CORP: Closed-Form One-shot Representation-Preserving Structured Pruning for Vision Transformers}, 
+      title={CORP: Closed-Form One-shot Representation-Preserving Structured Pruning}, 
       author={Boxiang Zhang and Baijian Yang},
       year={2026},
       eprint={2602.05243},

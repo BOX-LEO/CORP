@@ -1,0 +1,149 @@
+<!-- Math rendering: kramdown turns $$...$$ into \(...\) (inline) and \[...\] (display), which MathJax typesets. -->
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']]
+    }
+  };
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-chtml.js"></script>
+<style>
+  /* Long equations scroll on their own on narrow screens instead of widening the page. */
+  mjx-container[display="true"] {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  /* Headline numbers under the lay summary. */
+  .key-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    justify-content: space-around;
+    margin-bottom: 16px;
+    padding: 16px;
+    background: #efebe1;
+    border-radius: 4px;
+    text-align: center;
+  }
+  .key-stat {
+    flex: 1 1 120px;
+  }
+  .key-stat-value {
+    display: block;
+    color: #1c2b33;
+    font-size: 2.5em;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+  .key-stat-label {
+    display: block;
+    color: #1c2b33;
+  }
+
+  /* Keep row labels such as "DeiT-H" on one line. */
+  .markdown-body td:first-child {
+    white-space: nowrap;
+  }
+
+  /* Foldable sections, built by the script below. */
+  .fold-toggle {
+    all: unset;
+    cursor: pointer;
+  }
+  .fold-toggle:focus-visible {
+    outline: 2px solid #0969da;
+    outline-offset: 2px;
+  }
+  .fold-toggle::before {
+    content: "";
+    display: inline-block;
+    margin-right: 0.5em;
+    vertical-align: middle;
+    border-top: 0.3em solid transparent;
+    border-bottom: 0.3em solid transparent;
+    border-left: 0.45em solid #57606a;
+    transition: transform 0.15s;
+  }
+  .fold-toggle[aria-expanded="true"]::before {
+    transform: rotate(90deg);
+  }
+  @media print {
+    .fold-body[hidden] {
+      display: block !important;
+    }
+  }
+</style>
+<script>
+  // Makes each "##" heading fold its section. Without JavaScript the page stays fully expanded.
+  (function () {
+    var START_FOLDED = ['theory-how-much-error-remains'];
+
+    function setOpen(section, open) {
+      section.toggle.setAttribute('aria-expanded', String(open));
+      section.body.hidden = !open;
+    }
+
+    function openSectionForHash(sections) {
+      var id = decodeURIComponent(location.hash.slice(1));
+      var target = id && document.getElementById(id);
+      if (!target) return;
+      sections.forEach(function (section) {
+        if (section.body.contains(target)) setOpen(section, true);
+      });
+      target.scrollIntoView();
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      var root = document.querySelector('.markdown-body');
+      if (!root) return;
+
+      var sections = Array.prototype.map.call(root.querySelectorAll(':scope > h2'), function (heading) {
+        var body = document.createElement('div');
+        body.className = 'fold-body';
+        // Stop at the next section or at the theme's page footer, which is not part of any section.
+        while (heading.nextSibling && heading.nextSibling.nodeName !== 'H2' &&
+               !(heading.nextSibling.classList && heading.nextSibling.classList.contains('footer'))) {
+          body.appendChild(heading.nextSibling);
+        }
+        heading.after(body);
+
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'fold-toggle';
+        toggle.setAttribute('aria-expanded', 'true');
+        // The theme's anchor-js link stays next to the button, since a link cannot sit inside one.
+        Array.prototype.slice.call(heading.childNodes).forEach(function (node) {
+          if (!(node.classList && node.classList.contains('anchorjs-link'))) toggle.appendChild(node);
+        });
+        heading.insertBefore(toggle, heading.firstChild);
+
+        var section = { heading: heading, body: body, toggle: toggle };
+        toggle.addEventListener('click', function () {
+          setOpen(section, body.hidden);
+        });
+        return section;
+      });
+
+      // Fold only after MathJax finishes, so hidden equations are measured correctly.
+      function foldInitial() {
+        sections.forEach(function (section) {
+          if (START_FOLDED.indexOf(section.heading.id) !== -1) setOpen(section, false);
+        });
+        openSectionForHash(sections);
+      }
+
+      window.addEventListener('load', function () {
+        var ready = window.MathJax && window.MathJax.startup && window.MathJax.startup.promise;
+        if (ready) ready.then(foldInitial, foldInitial);
+        else foldInitial();
+      });
+      window.addEventListener('hashchange', function () {
+        openSectionForHash(sections);
+      });
+    });
+  })();
+</script>
